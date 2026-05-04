@@ -1,0 +1,7 @@
+data/input/*
+!data/input/.gitkeep
+data/output/*
+!data/output/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store
