@@ -32,6 +32,7 @@ from utils.constants import (
     PENALTY_INCOMING_GST, PENALTY_INCOMING_TDS,
     SCORE_CLOSE_CALL_MARGIN, SCORE_GST_CMS_CARDPMT, SCORE_GST_GATEWAY,
     SCORE_GST_GSTIN_PATTERN, SCORE_GST_KEYWORD, SCORE_GST_NONROUND_AMT,
+    SCORE_GST_UPI_DEBIT,
     SCORE_HIGH_THRESHOLD, SCORE_MEDIUM_THRESHOLD,
     SCORE_TDS_KEYWORD, SCORE_TDS_QUARTER_END,
     SCORE_TDS_SECTION_CODE, SCORE_TDS_TXTYPE_BLKNEFT,
@@ -189,6 +190,11 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         gst += SCORE_GST_CMS_CARDPMT
         dbg.append(f"GST CMS/card +{SCORE_GST_CMS_CARDPMT}")
 
+    # UPI outgoing debit — common merchant/vendor payment (Fix #4)
+    if tx_type == TxType.UPI_DEBIT:
+        gst += SCORE_GST_UPI_DEBIT
+        dbg.append(f"GST UPI debit +{SCORE_GST_UPI_DEBIT}")
+
     if debit > 0 and _is_nonround(debit):
         gst += SCORE_GST_NONROUND_AMT
         dbg.append(f"GST non-round amt +{SCORE_GST_NONROUND_AMT}")
@@ -207,30 +213,44 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     result.tds_score = tds
     result.gst_score = gst
 
-    # ── Category decision (Fix #4 — priority override) ───────────────────────
+    # ── Category decision ─────────────────────────────────────────────────────
+    # Priority 1: Strong TDS overrides everything (Fix #7)
     if tds >= SCORE_HIGH_THRESHOLD:
-        # Strong TDS always wins — even if GST signals also present
         result.category = CATEGORY_TDS
         dbg.append(f"TDS priority override tds={tds} ≥ {SCORE_HIGH_THRESHOLD}")
 
+    # Priority 2: High-confidence GST
     elif gst >= SCORE_HIGH_THRESHOLD:
         result.category = CATEGORY_GST
-        dbg.append(f"GST high tds={tds} gst={gst}")
+        dbg.append(f"GST high gst={gst}")
 
+    # Priority 3: Medium TDS wins over medium GST
     elif tds >= SCORE_MEDIUM_THRESHOLD and tds >= gst:
         result.category = CATEGORY_TDS
         dbg.append(f"TDS medium tds={tds}")
 
+    # Priority 4: Medium GST
     elif gst >= SCORE_MEDIUM_THRESHOLD:
         result.category = CATEGORY_GST
         dbg.append(f"GST medium gst={gst}")
 
-    elif max(tds, gst) < SCORE_UNCERTAIN_CUTOFF:
-        result.category = CATEGORY_UNCERTAIN  # Fix #11
-        dbg.append(f"UNCERTAIN — both below cutoff {SCORE_UNCERTAIN_CUTOFF}")
+    # Priority 5: Soft GST — any positive GST score still means GST (Fix #6)
+    # Avoids pushing real merchant/GST transactions into UNCERTAIN or NORMAL
+    elif gst > 0:
+        result.category = CATEGORY_GST
+        dbg.append(f"GST soft gst={gst} > 0")
 
+    # Priority 6: UNCERTAIN — only when BOTH scores are in the ambiguous mid-range
+    # i.e. some signals exist (tds > 0) but not enough to classify confidently
+    # Score = 0 on both → NORMAL, NOT UNCERTAIN (Fix #2, #3, #8)
+    elif tds > 0 and tds < SCORE_UNCERTAIN_CUTOFF:
+        result.category = CATEGORY_UNCERTAIN
+        dbg.append(f"UNCERTAIN — weak TDS signals tds={tds}")
+
+    # Default: no meaningful signals → NORMAL
     else:
         result.category = CATEGORY_NORMAL
+        dbg.append(f"NORMAL — no signals tds={tds} gst={gst}")
 
     return _finalise(result, debit, credit, amount, dbg)
 
