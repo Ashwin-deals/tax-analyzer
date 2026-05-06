@@ -2,6 +2,9 @@ data/input/*
 !data/input/.gitkeep
 data/output/*
 !data/output/.gitkeep
+data/email_statements/*
+!data/email_statements/.gitkeep
+.env
 __pycache__/
 *.pyc
 .DS_Store

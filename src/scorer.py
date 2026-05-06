@@ -26,6 +26,7 @@ from src.parser import TxType, parse_transaction_type
 from utils.constants import (
     AMOUNT_FLAG_ABOVE, AMOUNT_IGNORE_BELOW,
     CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN,
+    COMPANY_SUFFIX_PENALTIES,
     GST_KEYWORDS, MERCHANT_KEYWORDS, NEGATIVE_KEYWORDS,
     INTERNAL_CREDIT_COL, INTERNAL_DATE_COL,
     INTERNAL_DEBIT_COL, INTERNAL_DESCRIPTION_COL,
@@ -83,6 +84,15 @@ _NEGATIVE_PATTERNS: list[tuple[re.Pattern, int]] = [
     for pattern, is_regex, penalty in NEGATIVE_KEYWORDS
 ]
 
+# Company suffix penalties — applied to TDS score only (not GST)
+_COMPANY_SUFFIX_PATTERNS: list[tuple[re.Pattern, int]] = [
+    (
+        re.compile(pattern if is_regex else re.escape(pattern), re.IGNORECASE),
+        penalty,
+    )
+    for pattern, is_regex, penalty in COMPANY_SUFFIX_PENALTIES
+]
+
 # Quarter-end months for TDS date signal
 _QUARTER_END_MONTHS = {3, 6, 9, 12}
 
@@ -128,6 +138,15 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         dbg.append(f"amount ₹{amount} < ₹1 → NORMAL (skip scoring)")
         return _finalise(result, debit, credit, amount, dbg)
 
+    # ── Fix #1: Salary credit hard override ──────────────────────────────────
+    # Narrations like "net salary after TDS" are income, not a TDS deduction.
+    # If the transaction is an incoming credit and contains salary signals, force NORMAL.
+    _SALARY_SIGNALS = ("salary", "net salary", "payroll", "wages")
+    if credit > 0 and debit == 0 and any(s in text for s in _SALARY_SIGNALS):
+        dbg.append("salary credit → NORMAL hard override")
+        result.category = CATEGORY_NORMAL
+        return _finalise(result, debit, credit, amount, dbg)
+
     # ── Transaction type (Fix #5) ─────────────────────────────────────────────
     tx_type = parse_transaction_type(text)
     dbg.append(f"tx={tx_type.value}")
@@ -136,9 +155,6 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     if tx_type == TxType.ATM_WITHDRAWAL:
         dbg.append("ATM withdrawal → NORMAL override")
         return _finalise(result, debit, credit, amount, dbg)
-
-    # ── Negative penalties (Fix #6 — soft, not cancel) ───────────────────────
-    neg = _negative_penalty(text, dbg)
 
     # ── TDS scoring ───────────────────────────────────────────────────────────
     tds = 0
@@ -158,6 +174,12 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         if _RE_SECTION_CONTEXT.search(text):
             tds += SCORE_TDS_SECTION_CODE
             dbg.append(f"TDS section code (context) +{SCORE_TDS_SECTION_CODE}")
+
+    # Fix #6: Bare section code (194/195/206) with no letter — weaker signal
+    if tds == 0 and debit > 0:
+        if re.search(r'\b(194|195|206)\b', text):
+            tds += 4
+            dbg.append("TDS bare section code +4")
 
     if tx_type == TxType.BULK_NEFT:
         tds += SCORE_TDS_TXTYPE_BLKNEFT
@@ -199,8 +221,10 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         gst += SCORE_GST_NONROUND_AMT
         dbg.append(f"GST non-round amt +{SCORE_GST_NONROUND_AMT}")
 
-    # ── Apply soft negative penalties to both (Fix #6) ───────────────────────
-    tds = max(0, tds + neg)
+    # ── Apply soft negative penalties (Fix #6) ────────────────────────────────
+    neg      = _negative_penalty(text, dbg)         # applies to both
+    neg_tds  = _company_suffix_penalty(text, dbg)   # applies to TDS only
+    tds = max(0, tds + neg + neg_tds)
     gst = max(0, gst + neg)
 
     # ── Direction penalty — incoming credits (Fix #2) ─────────────────────────
@@ -214,8 +238,13 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     result.gst_score = gst
 
     # ── Category decision ─────────────────────────────────────────────────────
-    # Priority 1: Strong TDS overrides everything (Fix #7)
-    if tds >= SCORE_HIGH_THRESHOLD:
+    # Fix #3: Strong primary GST keywords (igst/cgst/sgst/utgst) prevent TDS override.
+    # E.g. "IGST PAYMENT PROFESSIONAL FEES 194J" should stay GST.
+    _STRONG_GST = {"igst", "cgst", "sgst", "utgst"}
+    has_strong_gst = any(kw in text for kw in _STRONG_GST)
+
+    # Priority 1: Strong TDS overrides everything — unless a primary GST keyword present
+    if tds >= SCORE_HIGH_THRESHOLD and not has_strong_gst:
         result.category = CATEGORY_TDS
         dbg.append(f"TDS priority override tds={tds} ≥ {SCORE_HIGH_THRESHOLD}")
 
@@ -291,8 +320,10 @@ def _finalise(result: ScoreResult, debit: float, credit: float,
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 def _safe_float(val) -> float:
+    """Convert val to float, returning 0.0 for None / NaN / unconvertible values."""
     try:
-        return float(val)
+        v = float(val)
+        return 0.0 if v != v else v   # v != v is True only for NaN
     except (TypeError, ValueError):
         return 0.0
 
@@ -319,4 +350,14 @@ def _negative_penalty(text: str, dbg: list) -> int:
         if pattern.search(text):
             total += penalty
             dbg.append(f"neg '{pattern.pattern}' {penalty}")
+    return total
+
+
+def _company_suffix_penalty(text: str, dbg: list) -> int:
+    """Penalty applied to TDS score ONLY — not GST."""
+    total = 0
+    for pattern, penalty in _COMPANY_SUFFIX_PATTERNS:
+        if pattern.search(text):
+            total += penalty
+            dbg.append(f"suffix '{pattern.pattern}' {penalty}")
     return total

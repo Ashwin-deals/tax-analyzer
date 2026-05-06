@@ -67,22 +67,45 @@ AMOUNT_FLAG_ABOVE   = 1_000_000.0  # > ₹10L → flag for review unless strong 
 # Each tuple: (pattern_string, is_regex, penalty_points)
 # Penalties are SUBTRACTED from both TDS and GST scores (not a hard cancel).
 NEGATIVE_KEYWORDS = [
+    # ─ Transfer / incoming signals ──────────────────────────────────────
     (r"upi/cr/",           False, -6),   # UPI incoming credit — money received
+    (r"upi/\d+//upi",      True,  -5),   # Truncated / malformed UPI narration
     (r"setdt-",            False, -5),   # Settlement date suffix in card narrations
     (r"imps-opm/",         False, -4),   # Standard IMPS transfer prefix
     (r"/p2p/",             False, -7),   # Peer-to-peer UPI transfer
     (r"\batm[/ ]",         True,  -8),   # ATM withdrawal
+    # ─ Personal / non-business payments ──────────────────────────────
     (r"birthday",          False, -6),   # Personal gift transfer
     (r"interest credit",   False, -5),   # Savings interest credit, not GST
-    (r"salary credit",     False, -5),   # Salary receipt, not TDS/GST
+    (r"salary credit",     False, -5),   # Salary receipt (reinforced by hard override)
+    (r"net salary",        False, -8),   # Net-of-TDS salary credit
+    (r"salary after tds",  False,-10),   # Explicit salary-after-TDS narration
     (r"personal",          False, -3),   # Personal transfer hint
-    (r"credit card bill",  False, -7),   # Credit card bill payment = bank transfer, not GST
-    (r"card bill payment", False, -7),   # Same — axis/hdfc card bill
-    (r"petrol",            False, -4),   # Petrol/fuel — personal expense, not merchant GST
+    (r"rent payment",      False, -5),   # Rent — personal expense, not GST
+    (r"\brent\b",          True,  -4),   # Rent keyword alone
+    (r"credit card bill",  False, -7),   # Credit card bill payment = bank transfer
+    (r"card bill payment", False, -7),   # Same
+    (r"petrol",            False, -4),   # Petrol — personal expense
     (r"fuel fill",         False, -4),   # Fuel station — personal
     (r"loan emi",          False, -5),   # Loan EMI = normal bank payment
     (r"insurance premium", False, -4),   # Insurance = normal payment
     (r"school fee",        False, -4),   # School fee = normal payment
+]
+
+# ── Company suffix penalties (applied to TDS score ONLY) ─────────────────────
+# Reduces TDS when a tax keyword appears inside a company/vendor name.
+# NOT applied to GST — so Razorpay Pvt Ltd / merchant gateway credits
+# are not penalized just for having 'Pvt Ltd' in the narration.
+COMPANY_SUFFIX_PENALTIES = [
+    (r"pvt ltd",           False, -5),
+    (r"private ltd",       False, -5),
+    (r"pvt\. ltd",         True,  -5),
+    (r"\bservices\b",      True,  -4),
+    (r"\bsolutions\b",     True,  -4),
+    (r"\bconsultants\b",   True,  -4),
+    (r"\benterprises\b",   True,  -4),
+    (r"\btechnologies\b",  True,  -4),
+    (r"\baccounting\b",    True,  -3),   # e.g. 'TDS Accounting Services'
 ]
 
 # ── TDS keywords (whole-word matched in classifier) ───────────────────────────
