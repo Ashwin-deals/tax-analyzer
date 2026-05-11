@@ -97,8 +97,14 @@ def run_classification(df: pd.DataFrame) -> pd.DataFrame:
     """Run the scorer on every row; add Predicted_Category and Confidence."""
     df = df.copy()
     score_results = df.apply(score_transaction, axis=1)
-    df[PREDICTED_COL] = [r.category   for r in score_results]
-    df["Confidence"]  = [r.confidence for r in score_results]
+    # ── Map results to new columns ────────────────────────────────────────────
+    df["Predicted_Category"]  = [r.category            for r in score_results]
+    df["Confidence"]          = [r.confidence          for r in score_results]
+    df["Needs_Review"]        = [r.needs_review        for r in score_results]
+    df["Reason"]              = [r.reason              for r in score_results]
+
+    from src.ml_pipeline import append_to_training_data
+    append_to_training_data(df, list(score_results))
 
     # Drop internal alias columns
     df.drop(columns=[c for c in INTERNAL_COLS if c in df.columns], inplace=True)

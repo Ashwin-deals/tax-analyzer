@@ -29,15 +29,15 @@ import pandas as pd
 from src.parser import TxType, parse_transaction_type
 from utils.constants import (
     AMOUNT_FLAG_ABOVE, AMOUNT_IGNORE_BELOW,
-    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST,
+    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT,
     COMPANY_SUFFIX_PENALTIES,
-    GST_KEYWORDS, MERCHANT_KEYWORDS, NEGATIVE_KEYWORDS,
+    GST_KEYWORDS, GST_WEAK_HINTS, MERCHANT_KEYWORDS, NEGATIVE_KEYWORDS,
     NORMAL_OVERRIDE_KEYWORDS,
     INTERNAL_CREDIT_COL, INTERNAL_DATE_COL,
     INTERNAL_DEBIT_COL, INTERNAL_DESCRIPTION_COL,
     PENALTY_INCOMING_GST, PENALTY_INCOMING_TDS,
     SCORE_CLOSE_CALL_MARGIN, SCORE_GST_CMS_CARDPMT, SCORE_GST_GATEWAY,
-    SCORE_GST_GSTIN_PATTERN, SCORE_GST_KEYWORD, SCORE_GST_NONROUND_AMT,
+    SCORE_GST_GSTIN_PATTERN, SCORE_GST_KEYWORD, SCORE_GST_WEAK_HINT, SCORE_GST_NONROUND_AMT,
     SCORE_GST_UPI_DEBIT,
     SCORE_HIGH_THRESHOLD, SCORE_MEDIUM_THRESHOLD,
     SCORE_TDS_KEYWORD, SCORE_TDS_QUARTER_END,
@@ -101,27 +101,66 @@ _QUARTER_END_MONTHS = {3, 6, 9, 12}
 # ── Vendor overrides — loaded once at module import ───────────────────────────
 # Structure: list of (pattern_lower, category, priority)
 # priority: "HARD" or "SOFT"
-_VENDOR_OVERRIDES: list[tuple[str, str, str]] = []
+_VENDOR_INTELLIGENCE: list[dict] = []
+_LEARNING_MEMORY: dict[str, dict] = {}
 
-def _load_vendor_overrides() -> list[tuple[str, str, str]]:
-    csv_path = Path(__file__).resolve().parent.parent / "data" / "vendor_overrides.csv"
-    overrides: list[tuple[str, str, str]] = []
+def _load_vendor_intelligence() -> list[dict]:
+    csv_path = Path(__file__).resolve().parent.parent / "data" / "vendor_intelligence.csv"
+    intel = []
     if not csv_path.exists():
-        return overrides
+        return intel
     with csv_path.open(newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(
-            (line for line in fh if not line.lstrip().startswith("#")),
-        )
+        reader = csv.DictReader((line for line in fh if not line.lstrip().startswith("#")))
         for row in reader:
-            pattern  = row.get("vendor_pattern", "").strip().lower()
-            category = row.get("category", "").strip().upper()
-            priority = row.get("priority", "SOFT").strip().upper()
-            if pattern and category in (CATEGORY_GST, CATEGORY_TDS, CATEGORY_NORMAL):
-                overrides.append((pattern, category, priority))
-    logger.debug("Loaded %d vendor overrides from %s", len(overrides), csv_path)
-    return overrides
+            pattern = row.get("vendor_pattern", "").strip().lower()
+            cat = row.get("learned_category", "").strip().upper()
+            conf = row.get("confidence", "MEDIUM").strip().upper()
+            if pattern and cat:
+                intel.append({"pattern": pattern, "category": cat, "confidence": conf})
+    logger.debug("Loaded %d vendor intelligence patterns from %s", len(intel), csv_path)
+    return intel
 
-_VENDOR_OVERRIDES = _load_vendor_overrides()
+def _load_learning_memory() -> dict[str, dict]:
+    csv_path = Path(__file__).resolve().parent.parent / "data" / "learning_memory.csv"
+    mem = {}
+    if not csv_path.exists():
+        return mem
+    with csv_path.open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader((line for line in fh if not line.lstrip().startswith("#")))
+        for row in reader:
+            pattern = row.get("vendor_pattern", "").strip().lower()
+            cat = row.get("corrected_category", "").strip().upper()
+            try:
+                count = int(row.get("count", "0").strip())
+            except ValueError:
+                count = 0
+            if pattern and cat and count > 0:
+                mem[pattern] = {"category": cat, "count": count}
+    logger.debug("Loaded %d learning memory rules from %s", len(mem), csv_path)
+    return mem
+
+_VENDOR_INTELLIGENCE = _load_vendor_intelligence()
+_LEARNING_MEMORY = _load_learning_memory()
+
+# ── Load ML Model ─────────────────────────────────────────────────────────────
+import joblib
+import numpy as np
+
+ML_MODEL = None
+ML_VEC = None
+try:
+    model_path = Path(__file__).resolve().parent.parent / "models" / "xgb_model.pkl"
+    vec_path = Path(__file__).resolve().parent.parent / "models" / "tfidf_vectorizer.pkl"
+    if model_path.exists() and vec_path.exists():
+        ML_MODEL = joblib.load(model_path)
+        ML_VEC = joblib.load(vec_path)
+except Exception as e:
+    logger.warning("Failed to load ML model: %s", e)
+
+def reload_memory():
+    global _VENDOR_INTELLIGENCE, _LEARNING_MEMORY
+    _VENDOR_INTELLIGENCE = _load_vendor_intelligence()
+    _LEARNING_MEMORY = _load_learning_memory()
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
@@ -135,6 +174,11 @@ class ScoreResult:
     classification_mode: str = "HEURISTIC"
     needs_review: bool = False
     reason:       str  = ""          # ← human-readable explanation
+    vendor:       str  = ""
+    transaction_type: str = ""
+    normalized_text: str = ""
+    ml_assist_score: float = 0.0
+    ml_model_confidence: float = 0.0
     debug_parts:  list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -144,6 +188,7 @@ class ScoreResult:
             "Mode":         self.classification_mode,
             "Needs_Review": self.needs_review,
             "Reason":       self.reason,
+            "ML_Assist":    f"{self.ml_model_confidence:.2%}" if self.classification_mode == "ML_ASSISTED" else "N/A"
         }
 
 
@@ -194,30 +239,53 @@ def score_transaction(row: pd.Series) -> ScoreResult:
 
     # ── Transaction type ──────────────────────────────────────────────────────
     tx_type = parse_transaction_type(text)
+    result.transaction_type = tx_type.name if hasattr(tx_type, 'name') else str(tx_type)
 
     if tx_type == TxType.ATM_WITHDRAWAL:
         dbg.append("ATM withdrawal detected")
         return _finalise(result, debit, credit, amount, dbg)
 
-    # ── Vendor override (CSV-driven) ──────────────────────────────────────────
+    # ── Vendor Intelligence Layer ─────────────────────────────────────────────
     # Applied after ATM/salary hard overrides but BEFORE scoring.
-    # HARD: forces category unless a strong opposing tax keyword blocks it.
-    # SOFT: applies only when no strong GST/TDS signal detected.
-    vendor_override_cat   = None
-    vendor_override_prio  = None
-    for pattern, category, priority in _VENDOR_OVERRIDES:
-        if pattern in text:
-            vendor_override_cat  = category
-            vendor_override_prio = priority
-            dbg.append(f"vendor override '{pattern}' → {category} ({priority})")
+    intel_cat = None
+    intel_conf = None
+    intel_pattern = None
+    is_learned = False
+
+    for vi in _VENDOR_INTELLIGENCE:
+        if vi["pattern"] in text:
+            intel_pattern = vi["pattern"]
+            intel_cat = vi["category"]
+            intel_conf = vi["confidence"]
+            result.vendor = vi["pattern"].upper()
+            dbg.append(f"Vendor intelligence '{intel_pattern}' → {intel_cat} ({intel_conf})")
             break
 
-    if vendor_override_cat == CATEGORY_NORMAL:
-        if vendor_override_prio == "HARD" and not has_strong_gst and not has_strong_tds:
+    # Apply learning memory overrides if threshold met
+    if intel_pattern and intel_pattern in _LEARNING_MEMORY:
+        mem = _LEARNING_MEMORY[intel_pattern]
+        if mem["count"] >= 3:  # Correction threshold
+            intel_cat = mem["category"]
+            intel_conf = "HIGH"
+            is_learned = True
+            dbg.append(f"Vendor memory suggests {intel_cat} based on {mem['count']} prior corrections")
+
+    if intel_cat == CATEGORY_NORMAL:
+        if intel_conf == "HIGH" and not has_strong_gst and not has_strong_tds:
             result.category = CATEGORY_NORMAL
+            if is_learned:
+                result.classification_mode = "LEARNED"
             dbg.append("Known non-tax vendor matched")
             return _finalise(result, debit, credit, amount, dbg)
-        # SOFT: deferred — applied at end of decision tree if no strong signal
+        # MEDIUM confidence NORMAL deferred to end of scoring
+        
+    if intel_cat == CATEGORY_BUSINESS_PAYMENT:
+        if intel_conf == "HIGH" and not has_strong_gst and not has_strong_tds:
+            result.category = CATEGORY_BUSINESS_PAYMENT
+            if is_learned:
+                result.classification_mode = "LEARNED"
+            dbg.append("Known business/merchant payment vendor matched")
+            return _finalise(result, debit, credit, amount, dbg)
 
     # ── TDS scoring ───────────────────────────────────────────────────────────
     tds = 0
@@ -276,11 +344,40 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         if pattern.search(text):
             gst += SCORE_GST_KEYWORD
             result.classification_mode = "EXPLICIT"
-            dbg.append("Explicit GST keyword found")
+            dbg.append(f"Explicit GST keyword found: {kw}")
             break
+            
+    # Check weak hints (do not make explicit, just add to heuristic score)
+    for kw in GST_WEAK_HINTS:
+        if re.search(r'\b' + re.escape(kw) + r'\b', text, re.IGNORECASE):
+            gst += SCORE_GST_WEAK_HINT
+            dbg.append(f"Weak GST/tax hint found: {kw}")
+            break
+
+    # Apply Vendor Intelligence Bias
+    if intel_cat == CATEGORY_POSSIBLE_GST:
+        if is_learned:
+            result.classification_mode = "LEARNED"
+            gst += 8
+        elif intel_conf == "HIGH":
+            gst += 6
+        else:
+            gst += 4
+        dbg.append(f"Vendor intelligence applied {intel_conf} GST bias")
+    elif intel_cat == CATEGORY_TDS:
+        if is_learned:
+            result.classification_mode = "LEARNED"
+            tds += 8
+        elif intel_conf == "HIGH":
+            tds += 6
+        else:
+            tds += 4
+        dbg.append(f"Vendor intelligence applied {intel_conf} TDS bias")
 
     for kw in _MERCHANT_SET:
         if kw in text:
+            if not result.vendor:
+                result.vendor = kw.upper()
             gst += SCORE_GST_GATEWAY
             dbg.append("Possible business/merchant payment inferred")
             break
@@ -353,9 +450,9 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         dbg.append(f"UNCERTAIN — competing signals tds={tds} gst={gst}")
 
     # Priority 7: Soft vendor override (SOFT priority, no strong tax signal)
-    elif vendor_override_cat == CATEGORY_NORMAL and vendor_override_prio == "SOFT":
+    elif intel_cat == CATEGORY_NORMAL and intel_conf == "MEDIUM":
         result.category = CATEGORY_NORMAL
-        dbg.append("SOFT vendor override applied → NORMAL")
+        dbg.append("MEDIUM vendor intelligence override applied → NORMAL")
 
     # Default: no meaningful signals → NORMAL
     else:
@@ -380,9 +477,51 @@ def _finalise(result: ScoreResult, debit: float, credit: float,
     else:
         result.confidence = "LOW"
 
-    # ── Map Heuristic GST to POSSIBLE_GST ─────────────────────────────────────
+    # ── Map Heuristic GST to BUSINESS_PAYMENT or POSSIBLE_GST ─────────────────
     if result.category == CATEGORY_GST and result.classification_mode == "HEURISTIC":
-        result.category = CATEGORY_POSSIBLE_GST
+        has_weak_hint = any("Weak GST/tax hint found" in d for d in dbg)
+        has_tax_vendor = any("Vendor intelligence" in d and "POSSIBLE_GST" in d for d in dbg)
+        
+        if has_weak_hint or has_tax_vendor:
+            result.category = CATEGORY_POSSIBLE_GST
+        else:
+            result.category = CATEGORY_BUSINESS_PAYMENT
+
+    # ── ML Assistance Layer ───────────────────────────────────────────────────
+    # Apply ML model ONLY for ambiguous HEURISTIC cases
+    is_ambiguous = (result.category in (CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT, CATEGORY_NORMAL)) and (result.classification_mode == "HEURISTIC")
+    
+    if is_ambiguous and ML_MODEL is not None and ML_VEC is not None:
+        try:
+            texts = [result.normalized_text]
+            X_text = ML_VEC.transform(texts).toarray()
+            X_num = np.array([[result.gst_score, result.tds_score, np.log1p(debit + credit)]])
+            X = np.hstack((X_text, X_num))
+            
+            pred_prob = ML_MODEL.predict_proba(X)[0]
+            ml_pred = CATEGORY_POSSIBLE_GST if ML_MODEL.predict(X)[0] == 1 else CATEGORY_NORMAL
+            ml_conf = float(pred_prob.max())
+            
+            result.ml_model_confidence = ml_conf
+            
+            # Strict Intervention Gating
+            # BUSINESS_PAYMENT is owned by the rule engine — ML must never override it
+            if result.category == CATEGORY_BUSINESS_PAYMENT:
+                dbg.append(f"ML Layer: NO_OVERRIDE (Rule owns BUSINESS_PAYMENT; ML={ml_pred} @ {ml_conf:.2%})")
+            elif ml_conf < 0.85:
+                dbg.append("ML Layer: NO_OVERRIDE (Low Confidence)")
+            elif (ml_pred != result.category
+                  and ml_conf > 0.90
+                  and result.confidence in ("LOW", "MEDIUM")
+                  and result.category == CATEGORY_NORMAL):
+                # Only allow NORMAL → POSSIBLE_GST promotion
+                dbg.append(f"ML Override: {result.category} → {ml_pred} (ML Conf: {ml_conf:.2%})")
+                result.category = ml_pred
+            else:
+                if ml_pred == result.category and ml_conf > 0.80:
+                    dbg.append(f"ML Confirmed: {ml_pred} (ML Conf: {ml_conf:.2%})")
+        except Exception as e:
+            pass
 
     # Needs_Review
     # Trigger ONLY if:

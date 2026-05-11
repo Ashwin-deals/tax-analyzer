@@ -30,6 +30,7 @@ from src.loader import load_excel
 from src.processor import process_transactions
 from utils.constants import (
     CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST,
+    CATEGORY_BUSINESS_PAYMENT,
 )
 from utils.email_utils import is_configured, load_credentials, mask_email
 
@@ -79,6 +80,7 @@ st.markdown("""
     .card-total   { border-left-color: #6366f1; }  .card-total   .value { color: #6366f1; }
     .card-gst     { border-left-color: #22c55e; }  .card-gst     .value { color: #22c55e; }
     .card-possible_gst { border-left-color: #84cc16; } .card-possible_gst .value { color: #84cc16; }
+    .card-business_payment { border-left-color: #f97316; } .card-business_payment .value { color: #f97316; }
     .card-tds     { border-left-color: #f59e0b; }  .card-tds     .value { color: #f59e0b; }
     .card-normal  { border-left-color: #3b82f6; }  .card-normal  .value { color: #3b82f6; }
     .card-uncertain { border-left-color: #9ca3af; } .card-uncertain .value { color: #9ca3af; }
@@ -204,30 +206,32 @@ def _render_tab(df: pd.DataFrame, category: str, download_name: str):
 
 def _render_results(result: dict, source_label: str):
     """Render the full classification output: success banner, cards, tabs."""
-    gst_df          = result.get(CATEGORY_GST,          pd.DataFrame())
-    possible_gst_df = result.get(CATEGORY_POSSIBLE_GST, pd.DataFrame())
-    tds_df          = result.get(CATEGORY_TDS,          pd.DataFrame())
-    normal_df       = result.get(CATEGORY_NORMAL,       pd.DataFrame())
-    uncertain_df    = result.get(CATEGORY_UNCERTAIN,    pd.DataFrame())
-    total           = len(gst_df) + len(possible_gst_df) + len(tds_df) + len(normal_df) + len(uncertain_df)
+    gst_df           = result.get(CATEGORY_GST,              pd.DataFrame())
+    possible_gst_df  = result.get(CATEGORY_POSSIBLE_GST,     pd.DataFrame())
+    biz_pay_df       = result.get(CATEGORY_BUSINESS_PAYMENT, pd.DataFrame())
+    tds_df           = result.get(CATEGORY_TDS,              pd.DataFrame())
+    normal_df        = result.get(CATEGORY_NORMAL,           pd.DataFrame())
+    uncertain_df     = result.get(CATEGORY_UNCERTAIN,        pd.DataFrame())
+    total = len(gst_df) + len(possible_gst_df) + len(biz_pay_df) + len(tds_df) + len(normal_df) + len(uncertain_df)
 
     st.success(f"✅ Classified **{total:,} transactions** from `{source_label}`")
     st.divider()
 
-    # Summary cards
+    # Summary cards (7 columns)
     st.markdown("### 📊 Classification Summary")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.markdown(_card("Total",     total,           "card-total"),     unsafe_allow_html=True)
-    c2.markdown(_card("GST",       len(gst_df),     "card-gst"),       unsafe_allow_html=True)
-    c3.markdown(_card("Poss GST",  len(possible_gst_df), "card-possible_gst"), unsafe_allow_html=True)
-    c4.markdown(_card("TDS",       len(tds_df),     "card-tds"),       unsafe_allow_html=True)
-    c5.markdown(_card("Normal",    len(normal_df),  "card-normal"),    unsafe_allow_html=True)
-    c6.markdown(_card("Uncertain", len(uncertain_df), "card-uncertain"), unsafe_allow_html=True)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.markdown(_card("Total",        total,                "card-total"),          unsafe_allow_html=True)
+    c2.markdown(_card("GST",          len(gst_df),          "card-gst"),            unsafe_allow_html=True)
+    c3.markdown(_card("Poss GST",     len(possible_gst_df), "card-possible_gst"),   unsafe_allow_html=True)
+    c4.markdown(_card("Biz Payment",  len(biz_pay_df),      "card-business_payment"), unsafe_allow_html=True)
+    c5.markdown(_card("TDS",          len(tds_df),          "card-tds"),            unsafe_allow_html=True)
+    c6.markdown(_card("Normal",       len(normal_df),       "card-normal"),         unsafe_allow_html=True)
+    c7.markdown(_card("Uncertain",    len(uncertain_df),    "card-uncertain"),      unsafe_allow_html=True)
 
     st.divider()
 
     # Review banner
-    all_dfs = [gst_df, possible_gst_df, tds_df, normal_df, uncertain_df]
+    all_dfs = [gst_df, possible_gst_df, biz_pay_df, tds_df, normal_df, uncertain_df]
     review_total = sum(
         int(df["Needs_Review"].sum())
         for df in all_dfs
@@ -241,18 +245,67 @@ def _render_results(result: dict, source_label: str):
 
     # Result tabs
     st.markdown("### 📋 Classified Transactions")
-    t_gst, t_pgst, t_tds, t_normal, t_uncertain = st.tabs([
+    t_gst, t_pgst, t_biz, t_tds, t_normal, t_uncertain = st.tabs([
         f"🟢  GST  ({len(gst_df):,})",
         f"🟩  POSSIBLE GST  ({len(possible_gst_df):,})",
+        f"🟠  BUSINESS PAYMENT  ({len(biz_pay_df):,})",
         f"🟡  TDS  ({len(tds_df):,})",
         f"🔵  NORMAL  ({len(normal_df):,})",
         f"⚪  UNCERTAIN  ({len(uncertain_df):,})",
     ])
-    with t_gst:      _render_tab(gst_df,          "GST",          "gst_transactions.xlsx")
-    with t_pgst:     _render_tab(possible_gst_df, "POSSIBLE GST", "possible_gst_transactions.xlsx")
-    with t_tds:      _render_tab(tds_df,          "TDS",          "tds_transactions.xlsx")
-    with t_normal:   _render_tab(normal_df,       "NORMAL",       "normal_transactions.xlsx")
-    with t_uncertain: _render_tab(uncertain_df,   "UNCERTAIN",    "uncertain_transactions.xlsx")
+    with t_gst:      _render_tab(gst_df,          "GST",              "gst_transactions.xlsx")
+    with t_pgst:     _render_tab(possible_gst_df, "POSSIBLE GST",     "possible_gst_transactions.xlsx")
+    with t_biz:      _render_tab(biz_pay_df,      "BUSINESS PAYMENT", "business_payment_transactions.xlsx")
+    with t_tds:      _render_tab(tds_df,          "TDS",              "tds_transactions.xlsx")
+    with t_normal:   _render_tab(normal_df,       "NORMAL",           "normal_transactions.xlsx")
+    with t_uncertain: _render_tab(uncertain_df,   "UNCERTAIN",        "uncertain_transactions.xlsx")
+
+def _update_learning_memory(pattern: str, category: str):
+    import csv
+    mem_path = Path(__file__).resolve().parent.parent / "data" / "learning_memory.csv"
+    
+    rows = []
+    found = False
+    if mem_path.exists():
+        with mem_path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("vendor_pattern") == pattern and row.get("corrected_category") == category:
+                    row["count"] = str(int(row.get("count", 0)) + 1)
+                    found = True
+                rows.append(row)
+                
+    if not found:
+        rows.append({"vendor_pattern": pattern, "corrected_category": category, "count": "1"})
+        
+    with mem_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["vendor_pattern", "corrected_category", "count"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # ── Vendor Learning UI ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 🧠 Train Vendor Memory")
+    st.write("Help the system learn! If a vendor is consistently misclassified, submit a correction below.")
+    
+    with st.expander("Submit Vendor Correction"):
+        with st.form("train_memory_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                vendor_input = st.text_input("Vendor Pattern (e.g., 'RAZORPAY', 'SWIGGY', 'TNEB')", help="A unique word or phrase found in the transaction narration.")
+            with col2:
+                corrected_cat = st.selectbox("Correct Category", ["NORMAL", "GST", "POSSIBLE_GST", "BUSINESS_PAYMENT", "TDS"])
+            
+            if st.form_submit_button("Train System"):
+                if vendor_input.strip():
+                    _update_learning_memory(vendor_input.strip().lower(), corrected_cat)
+                    from src.scorer import reload_memory
+                    from src.ml_pipeline import log_user_correction
+                    reload_memory()
+                    log_user_correction(vendor_input.strip(), corrected_cat)
+                    st.success(f"✅ Learned! '{vendor_input}' is now biased towards {corrected_cat}. Re-run the classification to see changes.")
+                else:
+                    st.error("Please enter a vendor pattern.")
 
 
 def _run_pipeline(file_path: Path) -> dict:

@@ -17,7 +17,7 @@ from openpyxl.utils import get_column_letter
 
 from utils.constants import (
     CATEGORY_COLOURS, CATEGORY_GST, CATEGORY_NORMAL,
-    CATEGORY_TDS, CATEGORY_UNCERTAIN,
+    CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT,
     DEFAULT_OUTPUT_DIR, OUTPUT_FILENAMES, SUMMARY_FILENAME,
 )
 from utils.helpers import build_summary
@@ -47,7 +47,7 @@ def export_data(
 
     exported: list[tuple[str, int]] = []
 
-    for category in [CATEGORY_TDS, CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_UNCERTAIN]:
+    for category in [CATEGORY_TDS, CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT, CATEGORY_NORMAL, CATEGORY_UNCERTAIN]:
         df = data_dict.get(category, pd.DataFrame())
         filename = OUTPUT_FILENAMES[category]
         dest = out_dir / filename

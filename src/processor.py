@@ -15,8 +15,10 @@ import pandas as pd
 from src.scorer import score_transaction
 from utils.constants import (
     CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST,
+    CATEGORY_BUSINESS_PAYMENT,
     INTERNAL_COLS,
 )
+from src.ml_pipeline import append_to_training_data
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,7 @@ def process_transactions(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     if df.empty:
         logger.warning("Input DataFrame is empty — nothing to process.")
         empty = pd.DataFrame()
-        return {k: empty for k in [CATEGORY_GST, CATEGORY_TDS, CATEGORY_NORMAL, CATEGORY_UNCERTAIN]}
+        return {k: empty for k in [CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT, CATEGORY_TDS, CATEGORY_NORMAL, CATEGORY_UNCERTAIN]}
 
     logger.info("Scoring %d transactions …", len(df))
 
@@ -44,7 +46,12 @@ def process_transactions(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     df["Confidence"]          = [r.confidence          for r in score_results]
     df["Classification_Mode"] = [r.classification_mode for r in score_results]
     df["Needs_Review"]        = [r.needs_review        for r in score_results]
+    df["ML_Assist"]           = [f"{r.ml_model_confidence:.2%}" if r.ml_model_confidence > 0 else "N/A" for r in score_results]
     df["Reason"]              = [r.reason              for r in score_results]
+
+    # ── Export to ML Training Dataset ─────────────────────────────────────────
+    # We do this BEFORE dropping internal alias columns because ml_pipeline needs them
+    append_to_training_data(df, list(score_results))
 
     # ── Drop internal alias columns before export ──────────────────────────────
     cols_to_drop = [c for c in INTERNAL_COLS if c in df.columns]
@@ -57,17 +64,18 @@ def process_transactions(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
     # ── Split ─────────────────────────────────────────────────────────────────
     result = {
-        CATEGORY_GST:          _filter(df, CATEGORY_GST),
-        CATEGORY_POSSIBLE_GST: _filter(df, CATEGORY_POSSIBLE_GST),
-        CATEGORY_TDS:          _filter(df, CATEGORY_TDS),
-        CATEGORY_NORMAL:       _filter(df, CATEGORY_NORMAL),
-        CATEGORY_UNCERTAIN:    _filter(df, CATEGORY_UNCERTAIN),
+        CATEGORY_GST:              _filter(df, CATEGORY_GST),
+        CATEGORY_POSSIBLE_GST:     _filter(df, CATEGORY_POSSIBLE_GST),
+        CATEGORY_BUSINESS_PAYMENT: _filter(df, CATEGORY_BUSINESS_PAYMENT),
+        CATEGORY_TDS:              _filter(df, CATEGORY_TDS),
+        CATEGORY_NORMAL:           _filter(df, CATEGORY_NORMAL),
+        CATEGORY_UNCERTAIN:        _filter(df, CATEGORY_UNCERTAIN),
     }
 
     logger.info(
-        "Split — GST: %d, POSSIBLE_GST: %d, TDS: %d, NORMAL: %d, UNCERTAIN: %d",
-        len(result[CATEGORY_GST]), len(result[CATEGORY_POSSIBLE_GST]), len(result[CATEGORY_TDS]),
-        len(result[CATEGORY_NORMAL]), len(result[CATEGORY_UNCERTAIN]),
+        "Split — GST: %d, POSSIBLE_GST: %d, BUSINESS_PAYMENT: %d, TDS: %d, NORMAL: %d, UNCERTAIN: %d",
+        len(result[CATEGORY_GST]), len(result[CATEGORY_POSSIBLE_GST]), len(result[CATEGORY_BUSINESS_PAYMENT]),
+        len(result[CATEGORY_TDS]), len(result[CATEGORY_NORMAL]), len(result[CATEGORY_UNCERTAIN]),
     )
     return result
 

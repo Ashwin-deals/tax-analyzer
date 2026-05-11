@@ -30,8 +30,9 @@ DATE_COLUMN_CANDIDATES = [
 
 # ── Categories ────────────────────────────────────────────────────────────────
 CATEGORY_TDS       = "TDS"
-CATEGORY_GST       = "GST"
+CATEGORY_GST = "GST"
 CATEGORY_POSSIBLE_GST = "POSSIBLE_GST"
+CATEGORY_BUSINESS_PAYMENT = "BUSINESS_PAYMENT"
 CATEGORY_NORMAL    = "NORMAL"
 CATEGORY_UNCERTAIN = "UNCERTAIN"
 
@@ -47,14 +48,15 @@ SCORE_CLOSE_CALL_MARGIN  = 2    # TDS/GST within this margin → Needs_Review
 SCORE_TDS_KEYWORD        = 10
 SCORE_TDS_SECTION_CODE   = 8
 SCORE_TDS_TXTYPE_BLKNEFT = 4
-SCORE_TDS_QUARTER_END    = 2
+SCORE_TDS_QUARTER_END    = 1    # Reduced: timing alone can't elevate category
 
 # ── GST signal weights ────────────────────────────────────────────────────────
 SCORE_GST_KEYWORD        = 10
 SCORE_GST_GSTIN_PATTERN  = 9
-SCORE_GST_GATEWAY        = 6
-SCORE_GST_CMS_CARDPMT    = 5    # CMS_ / CARD PAYMENT tx type (Fix #4)
-SCORE_GST_UPI_DEBIT      = 3    # UPI/DR/ outgoing — reduced to avoid P2P false positives
+SCORE_GST_WEAK_HINT      = 4    # Weak hint (invoice, settlement, accounting)
+SCORE_GST_GATEWAY        = 3    # Reduced: gateway alone → BUSINESS_PAYMENT, not POSSIBLE_GST
+SCORE_GST_CMS_CARDPMT    = 2    # Reduced: card payment → BUSINESS_PAYMENT unless other signals
+SCORE_GST_UPI_DEBIT      = 1    # Reduced: UPI debit alone is insufficient for tax ambiguity
 SCORE_GST_NONROUND_AMT   = 2
 
 # Applied symmetrically when a transaction is a pure incoming credit (Fix #5)
@@ -171,9 +173,13 @@ GST_KEYWORDS = [
     "gst challan", "gst payable",
     "goods and service", "goods & service",
     "service tax",      # pre-GST era
-    "tax invoice",      # compound — acceptable
+]
+
+# ── GST weak hints (→ POSSIBLE_GST) ───────────────────────────────────────────
+GST_WEAK_HINTS = [
+    "tax invoice",      
     "proforma invoice", "e-invoice", "einvoice",
-    "invoice", "bill payment",
+    "invoice", "bill payment", "settlement", "accounting", "expense"
 ]
 
 # ── Merchant / payment-gateway keywords (→ GST) ───────────────────────────────
@@ -191,6 +197,7 @@ CATEGORY_COLOURS = {
     CATEGORY_TDS:          "FFFFC000",  # amber
     CATEGORY_GST:          "FF70AD47",  # green
     CATEGORY_POSSIBLE_GST: "FFA9D08E",  # light green
+    CATEGORY_BUSINESS_PAYMENT: "FFFFD966",  # light orange/yellow
     CATEGORY_NORMAL:       "FF4472C4",  # blue
     CATEGORY_UNCERTAIN:    "FFD9D9D9",  # light grey
     "SUMMARY":             "FF7030A0",  # purple
@@ -202,6 +209,7 @@ DEFAULT_OUTPUT_DIR = "data/output"
 OUTPUT_FILENAMES = {
     CATEGORY_GST:          "gst_transactions.xlsx",
     CATEGORY_POSSIBLE_GST: "possible_gst_transactions.xlsx",
+    CATEGORY_BUSINESS_PAYMENT: "business_payment_transactions.xlsx",
     CATEGORY_TDS:          "tds_transactions.xlsx",
     CATEGORY_NORMAL:       "normal_transactions.xlsx",
     CATEGORY_UNCERTAIN:    "uncertain_transactions.xlsx",
