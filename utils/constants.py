@@ -31,14 +31,16 @@ DATE_COLUMN_CANDIDATES = [
 # ── Categories ────────────────────────────────────────────────────────────────
 CATEGORY_TDS       = "TDS"
 CATEGORY_GST       = "GST"
+CATEGORY_POSSIBLE_GST = "POSSIBLE_GST"
 CATEGORY_NORMAL    = "NORMAL"
 CATEGORY_UNCERTAIN = "UNCERTAIN"
 
-# Thresholds recalibrated: UNCERTAIN is only for genuinely ambiguous mid-range scores.
-# Score=0 on both → NORMAL. Score 1-2 → NORMAL. Score 3-7 → possible UNCERTAIN.
+# Thresholds recalibrated: UNCERTAIN only fires when BOTH scores carry meaningful
+# competing signals (tds > 0 AND gst > 0, or one score in 4–7 range).
+# Score 0–3 on both → NORMAL (not UNCERTAIN).
 SCORE_HIGH_THRESHOLD     = 8    # ≥ 8  → HIGH confidence, direct classification
 SCORE_MEDIUM_THRESHOLD   = 3    # ≥ 3  → MEDIUM confidence, classifiable
-SCORE_UNCERTAIN_CUTOFF   = 3    # only used for truly ambiguous mid-range (3–5)
+SCORE_UNCERTAIN_CUTOFF   = 4    # raised: score 1–3 → NORMAL, score 4–7 → UNCERTAIN
 SCORE_CLOSE_CALL_MARGIN  = 2    # TDS/GST within this margin → Needs_Review
 
 # ── TDS signal weights ────────────────────────────────────────────────────────
@@ -63,33 +65,40 @@ PENALTY_INCOMING_GST = -5
 AMOUNT_IGNORE_BELOW = 1.0          # < ₹1  → skip TDS/GST scoring
 AMOUNT_FLAG_ABOVE   = 1_000_000.0  # > ₹10L → flag for review unless strong signal
 
-# ── Soft negative keyword penalties (Fix #6) ─────────────────────────────────
+# ── Soft negative keyword penalties ──────────────────────────────────────────
 # Each tuple: (pattern_string, is_regex, penalty_points)
 # Penalties are SUBTRACTED from both TDS and GST scores (not a hard cancel).
 NEGATIVE_KEYWORDS = [
     # ─ Transfer / incoming signals ──────────────────────────────────────
-    (r"upi/cr/",           False, -6),   # UPI incoming credit — money received
-    (r"upi/\d+//upi",      True,  -5),   # Truncated / malformed UPI narration
-    (r"setdt-",            False, -5),   # Settlement date suffix in card narrations
-    (r"imps-opm/",         False, -4),   # Standard IMPS transfer prefix
-    (r"/p2p/",             False, -7),   # Peer-to-peer UPI transfer
-    (r"\batm[/ ]",         True,  -8),   # ATM withdrawal
+    (r"upi/cr/",              False, -6),  # UPI incoming credit — money received
+    (r"upi/\d{10,}//upi\s*$",True,  -5),  # Truncated UPI narration (tightened: needs //upi at end)
+    (r"setdt-",               False, -5),  # Settlement date suffix in card narrations
+    (r"imps-opm/",            False, -4),  # Standard IMPS transfer prefix
+    (r"/p2p/",                False, -7),  # Peer-to-peer UPI transfer
+    (r"\batm[/ ]",            True,  -8),  # ATM withdrawal
     # ─ Personal / non-business payments ──────────────────────────────
-    (r"birthday",          False, -6),   # Personal gift transfer
-    (r"interest credit",   False, -5),   # Savings interest credit, not GST
-    (r"salary credit",     False, -5),   # Salary receipt (reinforced by hard override)
-    (r"net salary",        False, -8),   # Net-of-TDS salary credit
-    (r"salary after tds",  False,-10),   # Explicit salary-after-TDS narration
-    (r"personal",          False, -3),   # Personal transfer hint
-    (r"rent payment",      False, -5),   # Rent — personal expense, not GST
-    (r"\brent\b",          True,  -4),   # Rent keyword alone
-    (r"credit card bill",  False, -7),   # Credit card bill payment = bank transfer
-    (r"card bill payment", False, -7),   # Same
-    (r"petrol",            False, -4),   # Petrol — personal expense
-    (r"fuel fill",         False, -4),   # Fuel station — personal
-    (r"loan emi",          False, -5),   # Loan EMI = normal bank payment
-    (r"insurance premium", False, -4),   # Insurance = normal payment
-    (r"school fee",        False, -4),   # School fee = normal payment
+    (r"birthday",             False, -6),  # Personal gift transfer
+    (r"interest credit",      False, -5),  # Savings interest credit, not GST
+    (r"\bsalary\b.{0,10}\bcredit\b", True, -5),  # Salary credit (specific — won't catch 'TDS CREDIT')
+    (r"net salary",           False, -8),  # Net-of-TDS salary credit
+    (r"salary after tds",     False,-10),  # Explicit salary-after-TDS narration
+    (r"personal",             False, -3),  # Personal transfer hint
+    (r"rent payment",         False, -5),  # Rent — personal expense, not GST
+    (r"\brent\b",             True,  -4),  # Rent keyword alone
+    (r"credit card payment",  False, -10), # Credit card payment — kills bill-payment GST kw
+    (r"credit card bill",     False, -10), # Credit card bill — kills merchant + bill-payment
+    (r"card bill payment",    False, -10), # Explicit card bill phrasing
+    (r"card outstanding",     False, -7),  # Outstanding dues transfer
+    (r"petrol",               False, -4),  # Petrol — personal expense
+    (r"fuel fill",            False, -4),  # Fuel station — personal
+    (r"loan emi",             False, -5),  # Loan EMI = normal bank payment
+    (r"insurance premium",    False, -4),  # Insurance = normal payment
+    (r"school fee",           False, -4),  # School fee = normal payment
+    # ─ Statutory / government contributions ──────────────────────────
+    (r"epf contribution",     False, -8),  # Employee PF — statutory, not GST/TDS
+    (r"esic contribution",    False, -8),  # Employee State Insurance
+    (r"\bpf contribution\b",  True,  -7),  # Provident fund
+    (r"provident fund",       False, -5),  # PF general mention
 ]
 
 # ── Company suffix penalties (applied to TDS score ONLY) ─────────────────────
@@ -108,11 +117,47 @@ COMPANY_SUFFIX_PENALTIES = [
     (r"\baccounting\b",    True,  -3),   # e.g. 'TDS Accounting Services'
 ]
 
+# ── NORMAL override keywords ──────────────────────────────────────────────────
+# If ANY of these match the narration text → immediately classify as NORMAL,
+# BEFORE scoring. Replaces the fragile negative-penalty approach for utility
+# and statutory payments that are unambiguously personal/business expenses.
+#
+# IMPORTANT: This override is bypassed when a strong GST/TDS keyword is ALSO
+# present (e.g. "TNEB GST PAYMENT" stays GST). Bypass logic is in scorer.py.
+#
+# Each tuple: (pattern_string, is_regex)
+NORMAL_OVERRIDE_KEYWORDS = [
+    # ─ Electricity boards ──────────────────────────────────────────────
+    (r"\btneb\b",      True),   # Tamil Nadu Electricity Board
+    (r"\bbescom\b",   True),   # Bangalore Electricity
+    (r"\btsspdcl\b",  True),   # Telangana Southern
+    (r"\bkseb\b",     True),   # Kerala State Electricity
+    (r"\btangedco\b", True),   # Tamil Nadu Generation
+    (r"\bmsedcl\b",   True),   # Maharashtra
+    (r"\bwbsedcl\b",  True),   # West Bengal
+    (r"\bdvvnl\b",    True),   # UP Paschimanchal
+    (r"electricity bill",  False), # Generic electricity bill
+    # ─ Gas utilities ───────────────────────────────────────────────────
+    (r"\bigl\b",      True),   # Indraprastha Gas
+    (r"\bmgl\b",      True),   # Mahanagar Gas
+    (r"\badani gas\b",True),   # Adani Gas
+    (r"gas bill",     False),  # Generic gas bill
+    # ─ Water utilities ─────────────────────────────────────────────────
+    (r"\bcmwssb\b",   True),   # Chennai Metro Water
+    (r"\bbwssb\b",    True),   # Bangalore Water
+    (r"water bill",   False),  # Generic water bill
+    # ─ Statutory contributions ─────────────────────────────────────────
+    (r"\bepf\b.{0,20}\bcontribution\b", True),  # EPF contribution
+    (r"\besic\b.{0,20}\bcontribution\b", True),  # ESIC contribution
+]
+
 # ── TDS keywords (whole-word matched in classifier) ───────────────────────────
 TDS_KEYWORDS = [
     "tds", "tax deducted", "tax deducted at source",
     "tds deduction", "tds credit", "tds recovery",
     "income tax", "it refund", "it demand", "tcs",
+    "interest tax", "bank tds", "tds on interest", "deducted",
+    "u/s 194", "u/s 192", "u/s 195", "u/s 206",
 ]
 
 # TDS section codes — matched with letter suffix (194A) OR next to tds/section
@@ -143,20 +188,22 @@ MERCHANT_KEYWORDS = [
 
 # ── Category → header colour (openpyxl ARGB) ─────────────────────────────────
 CATEGORY_COLOURS = {
-    CATEGORY_TDS:       "FFFFC000",  # amber
-    CATEGORY_GST:       "FF70AD47",  # green
-    CATEGORY_NORMAL:    "FF4472C4",  # blue
-    CATEGORY_UNCERTAIN: "FFD9D9D9",  # light grey
-    "SUMMARY":          "FF7030A0",  # purple
+    CATEGORY_TDS:          "FFFFC000",  # amber
+    CATEGORY_GST:          "FF70AD47",  # green
+    CATEGORY_POSSIBLE_GST: "FFA9D08E",  # light green
+    CATEGORY_NORMAL:       "FF4472C4",  # blue
+    CATEGORY_UNCERTAIN:    "FFD9D9D9",  # light grey
+    "SUMMARY":             "FF7030A0",  # purple
 }
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DEFAULT_INPUT_PATH = "data/input/bank_statement.xlsx"
 DEFAULT_OUTPUT_DIR = "data/output"
 OUTPUT_FILENAMES = {
-    CATEGORY_GST:       "gst_transactions.xlsx",
-    CATEGORY_TDS:       "tds_transactions.xlsx",
-    CATEGORY_NORMAL:    "normal_transactions.xlsx",
-    CATEGORY_UNCERTAIN: "uncertain_transactions.xlsx",
+    CATEGORY_GST:          "gst_transactions.xlsx",
+    CATEGORY_POSSIBLE_GST: "possible_gst_transactions.xlsx",
+    CATEGORY_TDS:          "tds_transactions.xlsx",
+    CATEGORY_NORMAL:       "normal_transactions.xlsx",
+    CATEGORY_UNCERTAIN:    "uncertain_transactions.xlsx",
 }
 SUMMARY_FILENAME = "classification_summary.xlsx"

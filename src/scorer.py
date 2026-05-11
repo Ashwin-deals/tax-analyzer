@@ -1,33 +1,38 @@
 """
 src/scorer.py
 ─────────────
-Multi-signal scoring engine for transaction classification. (Phase 2)
+Multi-signal scoring engine for transaction classification.
 
-Each transaction is scored independently for TDS and GST using:
-  • Keyword signals          (Fix #1 whole-word, Fix #12 no bare "tax")
-  • Transaction-type signals (Fix #5)
-  • Debit/credit direction   (Fix #2)
-  • Amount sanity            (Fix #3)
-  • Priority override        (Fix #4)
-  • Soft negative penalties  (Fix #6)
-  • Config-driven weights    (Fix #9)
-  • Precompiled regex        (Fix #10)
-  • UNCERTAIN fallback       (Fix #11)
-  • Decision logging         (Fix #8)
+Architecture (v3):
+  1. NORMAL_OVERRIDE_KEYWORDS  — hard utility/statutory bypass before scoring
+  2. Vendor override CSV       — loaded once at startup; HARD/SOFT precedence
+  3. Salary credit override    — hard override for incoming salary credits
+  4. ATM override              — always NORMAL
+  5. TDS scoring               — keywords, section codes, BLKNEFT, quarter-end
+  6. GST scoring               — keywords, GSTIN, merchant, CMS/card, UPI, non-round
+  7. Negative penalties        — soft subtraction from both scores
+  8. Company suffix penalties  — TDS-only subtraction
+  9. Direction penalty         — incoming credits penalised
+ 10. Category decision         — HIGH > MEDIUM > SOFT GST > UNCERTAIN > NORMAL
+     UNCERTAIN only fires when BOTH scores ≥ SCORE_UNCERTAIN_CUTOFF
+ 11. Reason string             — human-readable explanation in every result
 """
 
+import csv
 import logging
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pandas as pd
 
 from src.parser import TxType, parse_transaction_type
 from utils.constants import (
     AMOUNT_FLAG_ABOVE, AMOUNT_IGNORE_BELOW,
-    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN,
+    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST,
     COMPANY_SUFFIX_PENALTIES,
     GST_KEYWORDS, MERCHANT_KEYWORDS, NEGATIVE_KEYWORDS,
+    NORMAL_OVERRIDE_KEYWORDS,
     INTERNAL_CREDIT_COL, INTERNAL_DATE_COL,
     INTERNAL_DEBIT_COL, INTERNAL_DESCRIPTION_COL,
     PENALTY_INCOMING_GST, PENALTY_INCOMING_TDS,
@@ -43,58 +48,80 @@ from utils.helpers import normalize_text
 
 logger = logging.getLogger(__name__)
 
-# ── Precompiled regex patterns (Fix #10) ──────────────────────────────────────
+# ── Precompiled regex patterns ────────────────────────────────────────────────
 
-# TDS keywords — whole-word boundaries
 _RE_TDS_KEYWORDS: list[tuple[str, re.Pattern]] = [
     (kw, re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE))
     for kw in TDS_KEYWORDS
 ]
 
-# Section codes matched with letter suffix (194A, 194J …)
 _RE_SECTION_WITH_LETTER: list[re.Pattern] = [
-    re.compile(rf"\b{code}[A-Z]\b", re.IGNORECASE)
+    re.compile(rf"\b{code}[A-Z]{{1,3}}\b", re.IGNORECASE)
     for code in TDS_SECTION_CODES
 ]
-# Section codes matched when preceded by "tds" or "section"
 _RE_SECTION_CONTEXT = re.compile(
     r"(tds|section)\s*(" + "|".join(TDS_SECTION_CODES) + r")\b",
     re.IGNORECASE,
 )
 
-# GST keywords — whole-word boundaries
 _RE_GST_KEYWORDS: list[tuple[str, re.Pattern]] = [
     (kw, re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE))
     for kw in GST_KEYWORDS
 ]
 
-# GSTIN: 2-digit state + 5-alpha PAN prefix + 4-digit + alpha + Z + alphanumeric
 _RE_GSTIN = re.compile(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][Z][A-Z0-9]\b")
 
-# Merchant keywords — simple substring (names don't need word boundaries)
-# Pre-built as set for O(1) lookup
 _MERCHANT_SET = set(MERCHANT_KEYWORDS)
 
-# Negative keyword patterns (Fix #6 — soft penalties, not cancellations)
 _NEGATIVE_PATTERNS: list[tuple[re.Pattern, int]] = [
-    (
-        re.compile(pattern if is_regex else re.escape(pattern), re.IGNORECASE),
-        penalty,
-    )
-    for pattern, is_regex, penalty in NEGATIVE_KEYWORDS
+    (re.compile(p if is_re else re.escape(p), re.IGNORECASE), pen)
+    for p, is_re, pen in NEGATIVE_KEYWORDS
 ]
 
-# Company suffix penalties — applied to TDS score only (not GST)
 _COMPANY_SUFFIX_PATTERNS: list[tuple[re.Pattern, int]] = [
-    (
-        re.compile(pattern if is_regex else re.escape(pattern), re.IGNORECASE),
-        penalty,
-    )
-    for pattern, is_regex, penalty in COMPANY_SUFFIX_PENALTIES
+    (re.compile(p if is_re else re.escape(p), re.IGNORECASE), pen)
+    for p, is_re, pen in COMPANY_SUFFIX_PENALTIES
 ]
 
-# Quarter-end months for TDS date signal
+# NORMAL override patterns — utility boards, statutory payments
+_NORMAL_OVERRIDE_PATTERNS: list[re.Pattern] = [
+    re.compile(p if is_re else re.escape(p), re.IGNORECASE)
+    for p, is_re in NORMAL_OVERRIDE_KEYWORDS
+]
+
+# Strong GST keywords that block TDS priority and (when present) bypass
+# NORMAL overrides (e.g. "TNEB GST PAYMENT" must stay GST, not become NORMAL)
+_STRONG_GST_KWS = {"igst", "cgst", "sgst", "utgst", "gst payment",
+                   "gst challan", "gst refund"}
+# Strong TDS keywords that block NORMAL overrides
+_STRONG_TDS_KWS = {"tds", "tax deducted", "income tax", "tcs", "it refund"}
+
 _QUARTER_END_MONTHS = {3, 6, 9, 12}
+
+# ── Vendor overrides — loaded once at module import ───────────────────────────
+# Structure: list of (pattern_lower, category, priority)
+# priority: "HARD" or "SOFT"
+_VENDOR_OVERRIDES: list[tuple[str, str, str]] = []
+
+def _load_vendor_overrides() -> list[tuple[str, str, str]]:
+    csv_path = Path(__file__).resolve().parent.parent / "data" / "vendor_overrides.csv"
+    overrides: list[tuple[str, str, str]] = []
+    if not csv_path.exists():
+        return overrides
+    with csv_path.open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(
+            (line for line in fh if not line.lstrip().startswith("#")),
+        )
+        for row in reader:
+            pattern  = row.get("vendor_pattern", "").strip().lower()
+            category = row.get("category", "").strip().upper()
+            priority = row.get("priority", "SOFT").strip().upper()
+            if pattern and category in (CATEGORY_GST, CATEGORY_TDS, CATEGORY_NORMAL):
+                overrides.append((pattern, category, priority))
+    logger.debug("Loaded %d vendor overrides from %s", len(overrides), csv_path)
+    return overrides
+
+_VENDOR_OVERRIDES = _load_vendor_overrides()
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
@@ -105,14 +132,18 @@ class ScoreResult:
     gst_score:    int  = 0
     category:     str  = CATEGORY_NORMAL
     confidence:   str  = "HIGH"
+    classification_mode: str = "HEURISTIC"
     needs_review: bool = False
+    reason:       str  = ""          # ← human-readable explanation
     debug_parts:  list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "Category":     self.category,
             "Confidence":   self.confidence,
+            "Mode":         self.classification_mode,
             "Needs_Review": self.needs_review,
+            "Reason":       self.reason,
         }
 
 
@@ -133,28 +164,60 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     date   = row.get(INTERNAL_DATE_COL)
     amount = debit if debit > 0 else credit
 
-    # ── Amount sanity (Fix #3) ────────────────────────────────────────────────
+    # ── Amount sanity ─────────────────────────────────────────────────────────
     if 0 < amount < AMOUNT_IGNORE_BELOW:
-        dbg.append(f"amount ₹{amount} < ₹1 → NORMAL (skip scoring)")
+        dbg.append(f"amount ₹{amount} < ₹{AMOUNT_IGNORE_BELOW} → skip scoring")
         return _finalise(result, debit, credit, amount, dbg)
 
-    # ── Fix #1: Salary credit hard override ──────────────────────────────────
-    # Narrations like "net salary after TDS" are income, not a TDS deduction.
-    # If the transaction is an incoming credit and contains salary signals, force NORMAL.
+    # ── Probe for strong tax keywords (used by override bypass logic) ─────────
+    has_strong_gst = any(kw in text for kw in _STRONG_GST_KWS)
+    has_strong_tds = any(kw in text for kw in _STRONG_TDS_KWS)
+    
+    result.classification_mode = "EXPLICIT" if (has_strong_gst or has_strong_tds) else "HEURISTIC"
+
+    # ── NORMAL override: utility / statutory payments ─────────────────────────
+    # If a utility keyword matches AND no strong GST/TDS keyword is present,
+    # immediately return NORMAL. This replaces fragile large negative penalties.
+    if not has_strong_gst and not has_strong_tds:
+        for pat in _NORMAL_OVERRIDE_PATTERNS:
+            if pat.search(text):
+                dbg.append(f"Statutory/utility payment detected")
+                result.category = CATEGORY_NORMAL
+                return _finalise(result, debit, credit, amount, dbg)
+
+    # ── Salary credit hard override ───────────────────────────────────────────
     _SALARY_SIGNALS = ("salary", "net salary", "payroll", "wages")
     if credit > 0 and debit == 0 and any(s in text for s in _SALARY_SIGNALS):
-        dbg.append("salary credit → NORMAL hard override")
+        dbg.append("Salary credit detected")
         result.category = CATEGORY_NORMAL
         return _finalise(result, debit, credit, amount, dbg)
 
-    # ── Transaction type (Fix #5) ─────────────────────────────────────────────
+    # ── Transaction type ──────────────────────────────────────────────────────
     tx_type = parse_transaction_type(text)
-    dbg.append(f"tx={tx_type.value}")
 
-    # ATM → always NORMAL, short-circuit
     if tx_type == TxType.ATM_WITHDRAWAL:
-        dbg.append("ATM withdrawal → NORMAL override")
+        dbg.append("ATM withdrawal detected")
         return _finalise(result, debit, credit, amount, dbg)
+
+    # ── Vendor override (CSV-driven) ──────────────────────────────────────────
+    # Applied after ATM/salary hard overrides but BEFORE scoring.
+    # HARD: forces category unless a strong opposing tax keyword blocks it.
+    # SOFT: applies only when no strong GST/TDS signal detected.
+    vendor_override_cat   = None
+    vendor_override_prio  = None
+    for pattern, category, priority in _VENDOR_OVERRIDES:
+        if pattern in text:
+            vendor_override_cat  = category
+            vendor_override_prio = priority
+            dbg.append(f"vendor override '{pattern}' → {category} ({priority})")
+            break
+
+    if vendor_override_cat == CATEGORY_NORMAL:
+        if vendor_override_prio == "HARD" and not has_strong_gst and not has_strong_tds:
+            result.category = CATEGORY_NORMAL
+            dbg.append("Known non-tax vendor matched")
+            return _finalise(result, debit, credit, amount, dbg)
+        # SOFT: deferred — applied at end of decision tree if no strong signal
 
     # ── TDS scoring ───────────────────────────────────────────────────────────
     tds = 0
@@ -162,91 +225,105 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     for kw, pattern in _RE_TDS_KEYWORDS:
         if pattern.search(text):
             tds += SCORE_TDS_KEYWORD
-            dbg.append(f"TDS kw '{kw}' +{SCORE_TDS_KEYWORD}")
+            result.classification_mode = "EXPLICIT"
+            dbg.append("Explicit TDS keyword found")
             break  # count once
 
     for pattern in _RE_SECTION_WITH_LETTER:
-        if pattern.search(text):
-            tds += SCORE_TDS_SECTION_CODE
-            dbg.append(f"TDS section code (letter) +{SCORE_TDS_SECTION_CODE}")
+        match = pattern.search(text)
+        if match:
+            matched_code = match.group(0).upper()
+            result.classification_mode = "EXPLICIT"
+            if "194A" in matched_code:
+                tds += 6
+                dbg.append("TDS section 194A detected")
+            elif "194J" in matched_code:
+                tds += 8
+                dbg.append("TDS section 194J detected")
+            else:
+                tds += 8
+                dbg.append(f"TDS section {matched_code} detected")
             break
     else:
         if _RE_SECTION_CONTEXT.search(text):
             tds += SCORE_TDS_SECTION_CODE
-            dbg.append(f"TDS section code (context) +{SCORE_TDS_SECTION_CODE}")
+            result.classification_mode = "EXPLICIT"
+            dbg.append("Contextual TDS section code detected")
 
-    # Fix #6: Bare section code (194/195/206) with no letter — weaker signal
-    if tds == 0 and debit > 0:
-        if re.search(r'\b(194|195|206)\b', text):
+    # Bare section code (194/195/206) — no debit condition required anymore
+    if tds == 0:
+        if re.search(r'\b(192|193|194|195|196|206)\b', text):
             tds += 4
-            dbg.append("TDS bare section code +4")
+            dbg.append("Implicit TDS section code detected")
 
     if tx_type == TxType.BULK_NEFT:
         tds += SCORE_TDS_TXTYPE_BLKNEFT
-        dbg.append(f"TDS BLKNEFT +{SCORE_TDS_TXTYPE_BLKNEFT}")
+        dbg.append("Bulk NEFT format detected")
 
     if _is_quarter_end(date):
         tds += SCORE_TDS_QUARTER_END
-        dbg.append(f"TDS quarter-end +{SCORE_TDS_QUARTER_END}")
+        dbg.append("Transaction occurred at quarter-end")
 
     # ── GST scoring ───────────────────────────────────────────────────────────
     gst = 0
 
     if _RE_GSTIN.search(text.upper()):
         gst += SCORE_GST_GSTIN_PATTERN
-        dbg.append(f"GST GSTIN +{SCORE_GST_GSTIN_PATTERN}")
+        result.classification_mode = "EXPLICIT"
+        dbg.append("Explicit GSTIN pattern detected")
 
     for kw, pattern in _RE_GST_KEYWORDS:
         if pattern.search(text):
             gst += SCORE_GST_KEYWORD
-            dbg.append(f"GST kw '{kw}' +{SCORE_GST_KEYWORD}")
+            result.classification_mode = "EXPLICIT"
+            dbg.append("Explicit GST keyword found")
             break
 
     for kw in _MERCHANT_SET:
         if kw in text:
             gst += SCORE_GST_GATEWAY
-            dbg.append(f"GST merchant '{kw}' +{SCORE_GST_GATEWAY}")
+            dbg.append("Possible business/merchant payment inferred")
             break
 
     if tx_type in (TxType.CMS, TxType.CARD_PAYMENT):
         gst += SCORE_GST_CMS_CARDPMT
-        dbg.append(f"GST CMS/card +{SCORE_GST_CMS_CARDPMT}")
+        dbg.append("Possible business expense inferred from card payment")
 
-    # UPI outgoing debit — common merchant/vendor payment (Fix #4)
     if tx_type == TxType.UPI_DEBIT:
         gst += SCORE_GST_UPI_DEBIT
-        dbg.append(f"GST UPI debit +{SCORE_GST_UPI_DEBIT}")
+        dbg.append("Possible merchant/business payment inferred from UPI narration")
 
     if debit > 0 and _is_nonround(debit):
         gst += SCORE_GST_NONROUND_AMT
-        dbg.append(f"GST non-round amt +{SCORE_GST_NONROUND_AMT}")
+        dbg.append("Non-round fractional amount")
 
-    # ── Apply soft negative penalties (Fix #6) ────────────────────────────────
-    neg      = _negative_penalty(text, dbg)         # applies to both
-    neg_tds  = _company_suffix_penalty(text, dbg)   # applies to TDS only
+    # ── Negative penalties ────────────────────────────────────────────────────
+    neg     = _negative_penalty(text, dbg)        # both TDS and GST
+    neg_tds = _company_suffix_penalty(text, dbg)  # TDS only
     tds = max(0, tds + neg + neg_tds)
     gst = max(0, gst + neg)
 
-    # ── Direction penalty — incoming credits (Fix #2) ─────────────────────────
+    # ── Direction penalty — incoming credits ──────────────────────────────────
     is_incoming = (credit > 0 and debit == 0)
     if is_incoming:
-        tds = max(0, tds + PENALTY_INCOMING_TDS)
-        gst = max(0, gst + PENALTY_INCOMING_GST)
-        dbg.append(f"incoming: TDS{PENALTY_INCOMING_TDS} GST{PENALTY_INCOMING_GST}")
+        is_refund = "refund" in text
+        if not (is_refund and gst > 0):
+            gst = max(0, gst + PENALTY_INCOMING_GST)
+            dbg.append("Incoming credit penalty applied to GST")
+        
+        # Exception: if we found strong TDS keywords/sections, do not penalize
+        if not (tds >= 8 or is_refund):
+            tds = max(0, tds + PENALTY_INCOMING_TDS)
+            dbg.append("Incoming credit penalty applied to TDS")
 
     result.tds_score = tds
     result.gst_score = gst
 
     # ── Category decision ─────────────────────────────────────────────────────
-    # Fix #3: Strong primary GST keywords (igst/cgst/sgst/utgst) prevent TDS override.
-    # E.g. "IGST PAYMENT PROFESSIONAL FEES 194J" should stay GST.
-    _STRONG_GST = {"igst", "cgst", "sgst", "utgst"}
-    has_strong_gst = any(kw in text for kw in _STRONG_GST)
-
-    # Priority 1: Strong TDS overrides everything — unless a primary GST keyword present
+    # Priority 1: Strong TDS — unless a primary GST keyword present
     if tds >= SCORE_HIGH_THRESHOLD and not has_strong_gst:
         result.category = CATEGORY_TDS
-        dbg.append(f"TDS priority override tds={tds} ≥ {SCORE_HIGH_THRESHOLD}")
+        dbg.append(f"TDS high tds={tds} ≥ {SCORE_HIGH_THRESHOLD}")
 
     # Priority 2: High-confidence GST
     elif gst >= SCORE_HIGH_THRESHOLD:
@@ -263,18 +340,22 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         result.category = CATEGORY_GST
         dbg.append(f"GST medium gst={gst}")
 
-    # Priority 5: Soft GST — any positive GST score still means GST (Fix #6)
-    # Avoids pushing real merchant/GST transactions into UNCERTAIN or NORMAL
+    # Priority 5: Soft GST — positive GST score, no competing TDS
     elif gst > 0:
         result.category = CATEGORY_GST
-        dbg.append(f"GST soft gst={gst} > 0")
+        dbg.append(f"GST soft gst={gst}")
 
-    # Priority 6: UNCERTAIN — only when BOTH scores are in the ambiguous mid-range
-    # i.e. some signals exist (tds > 0) but not enough to classify confidently
-    # Score = 0 on both → NORMAL, NOT UNCERTAIN (Fix #2, #3, #8)
-    elif tds > 0 and tds < SCORE_UNCERTAIN_CUTOFF:
+    # Priority 6: UNCERTAIN — ONLY when BOTH scores have meaningful competing
+    # signals (both ≥ SCORE_UNCERTAIN_CUTOFF). Avoids false UNCERTAIN for
+    # low-signal transactions that should simply be NORMAL.
+    elif tds >= SCORE_UNCERTAIN_CUTOFF and gst >= SCORE_UNCERTAIN_CUTOFF:
         result.category = CATEGORY_UNCERTAIN
-        dbg.append(f"UNCERTAIN — weak TDS signals tds={tds}")
+        dbg.append(f"UNCERTAIN — competing signals tds={tds} gst={gst}")
+
+    # Priority 7: Soft vendor override (SOFT priority, no strong tax signal)
+    elif vendor_override_cat == CATEGORY_NORMAL and vendor_override_prio == "SOFT":
+        result.category = CATEGORY_NORMAL
+        dbg.append("SOFT vendor override applied → NORMAL")
 
     # Default: no meaningful signals → NORMAL
     else:
@@ -284,7 +365,7 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     return _finalise(result, debit, credit, amount, dbg)
 
 
-# ── Finalise confidence + Needs_Review ────────────────────────────────────────
+# ── Finalise: confidence + Needs_Review + Reason ─────────────────────────────
 
 def _finalise(result: ScoreResult, debit: float, credit: float,
               amount: float, dbg: list) -> ScoreResult:
@@ -299,20 +380,35 @@ def _finalise(result: ScoreResult, debit: float, credit: float,
     else:
         result.confidence = "LOW"
 
-    # Needs_Review (Fix #7)
-    close_call = (abs(tds - gst) <= SCORE_CLOSE_CALL_MARGIN and top > 0)
+    # ── Map Heuristic GST to POSSIBLE_GST ─────────────────────────────────────
+    if result.category == CATEGORY_GST and result.classification_mode == "HEURISTIC":
+        result.category = CATEGORY_POSSIBLE_GST
+
+    # Needs_Review
+    # Trigger ONLY if:
+    # 1. Multiple competing signals (UNCERTAIN)
+    # 2. Medium confidence with a small score gap
+    is_tax = result.category in (CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_TDS)
+    score_gap = abs(tds - gst)
+
     result.needs_review = (
-        result.confidence == "LOW"
-        or result.category == CATEGORY_UNCERTAIN
-        or close_call
-        or (amount > AMOUNT_FLAG_ABOVE and top < SCORE_HIGH_THRESHOLD)
+        result.category == CATEGORY_UNCERTAIN
+        or (is_tax and (result.confidence == "LOW" or (result.confidence == "MEDIUM" and score_gap <= SCORE_CLOSE_CALL_MARGIN)))
     )
 
-    # Decision log (Fix #8)
+    # ── Reason string — human-readable, pipe-separated signal list ────────────
+    # Clean up empty strings and remove duplicates while preserving order
+    clean_dbg = []
+    for d in dbg:
+        if d and d not in clean_dbg:
+            clean_dbg.append(d)
+            
+    result.reason = " | ".join(clean_dbg) if clean_dbg else "No distinct signals found"
+
     logger.debug(
         "[%s|%s|review=%s] tds=%d gst=%d | %s",
         result.category, result.confidence, result.needs_review,
-        tds, gst, " → ".join(dbg),
+        tds, gst, result.reason,
     )
     return result
 
@@ -346,18 +442,24 @@ def _is_quarter_end(date_val) -> bool:
 
 def _negative_penalty(text: str, dbg: list) -> int:
     total = 0
+    matched = False
     for pattern, penalty in _NEGATIVE_PATTERNS:
         if pattern.search(text):
             total += penalty
-            dbg.append(f"neg '{pattern.pattern}' {penalty}")
+            matched = True
+    if matched:
+        dbg.append("Matched personal/transfer exclusion keyword")
     return total
 
 
 def _company_suffix_penalty(text: str, dbg: list) -> int:
     """Penalty applied to TDS score ONLY — not GST."""
     total = 0
+    matched = False
     for pattern, penalty in _COMPANY_SUFFIX_PATTERNS:
         if pattern.search(text):
             total += penalty
-            dbg.append(f"suffix '{pattern.pattern}' {penalty}")
+            matched = True
+    if matched:
+        dbg.append("Company suffix penalty applied")
     return total

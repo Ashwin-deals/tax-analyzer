@@ -14,7 +14,7 @@ import pandas as pd
 
 from src.scorer import score_transaction
 from utils.constants import (
-    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN,
+    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST,
     INTERNAL_COLS,
 )
 
@@ -40,9 +40,11 @@ def process_transactions(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     score_results = df.apply(score_transaction, axis=1)
 
     df = df.copy()
-    df["Category"]     = [r.category     for r in score_results]
-    df["Confidence"]   = [r.confidence   for r in score_results]
-    df["Needs_Review"] = [r.needs_review for r in score_results]
+    df["Category"]            = [r.category            for r in score_results]
+    df["Confidence"]          = [r.confidence          for r in score_results]
+    df["Classification_Mode"] = [r.classification_mode for r in score_results]
+    df["Needs_Review"]        = [r.needs_review        for r in score_results]
+    df["Reason"]              = [r.reason              for r in score_results]
 
     # ── Drop internal alias columns before export ──────────────────────────────
     cols_to_drop = [c for c in INTERNAL_COLS if c in df.columns]
@@ -55,15 +57,16 @@ def process_transactions(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
     # ── Split ─────────────────────────────────────────────────────────────────
     result = {
-        CATEGORY_GST:       _filter(df, CATEGORY_GST),
-        CATEGORY_TDS:       _filter(df, CATEGORY_TDS),
-        CATEGORY_NORMAL:    _filter(df, CATEGORY_NORMAL),
-        CATEGORY_UNCERTAIN: _filter(df, CATEGORY_UNCERTAIN),
+        CATEGORY_GST:          _filter(df, CATEGORY_GST),
+        CATEGORY_POSSIBLE_GST: _filter(df, CATEGORY_POSSIBLE_GST),
+        CATEGORY_TDS:          _filter(df, CATEGORY_TDS),
+        CATEGORY_NORMAL:       _filter(df, CATEGORY_NORMAL),
+        CATEGORY_UNCERTAIN:    _filter(df, CATEGORY_UNCERTAIN),
     }
 
     logger.info(
-        "Split — GST: %d, TDS: %d, NORMAL: %d, UNCERTAIN: %d",
-        len(result[CATEGORY_GST]), len(result[CATEGORY_TDS]),
+        "Split — GST: %d, POSSIBLE_GST: %d, TDS: %d, NORMAL: %d, UNCERTAIN: %d",
+        len(result[CATEGORY_GST]), len(result[CATEGORY_POSSIBLE_GST]), len(result[CATEGORY_TDS]),
         len(result[CATEGORY_NORMAL]), len(result[CATEGORY_UNCERTAIN]),
     )
     return result

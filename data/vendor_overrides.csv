@@ -1,0 +1,32 @@
+vendor_pattern,category,priority,notes
+# ── Electricity Boards ──────────────────────────────────────────────────────
+TNEB,NORMAL,HARD,Tamil Nadu Electricity Board
+BESCOM,NORMAL,HARD,Bangalore Electricity Supply Company
+TSSPDCL,NORMAL,HARD,Telangana Southern Power Distribution
+KSEB,NORMAL,HARD,Kerala State Electricity Board
+TANGEDCO,NORMAL,HARD,Tamil Nadu Generation and Distribution
+MSEDCL,NORMAL,HARD,Maharashtra State Electricity Distribution
+WBSEDCL,NORMAL,HARD,West Bengal State Electricity Distribution
+DVVNL,NORMAL,HARD,Dakshinanchal Vidyut Vitran Nigam (UP)
+# ── Gas Utilities ───────────────────────────────────────────────────────────
+IGL,NORMAL,HARD,Indraprastha Gas Limited
+MGL,NORMAL,HARD,Mahanagar Gas Limited
+ADANI GAS,NORMAL,HARD,Adani Gas Limited
+# ── Water Utilities ─────────────────────────────────────────────────────────
+CMWSSB,NORMAL,HARD,Chennai Metro Water Supply Board
+BWSSB,NORMAL,HARD,Bangalore Water Supply Board
+HMWSSB,NORMAL,HARD,Hyderabad Metro Water Supply
+# ── Telecom / DTH (SOFT — bill pay is normal, but GST keyword can override) ─
+AIRTEL,NORMAL,SOFT,Bharti Airtel (telecom recharge/bill)
+JIOFIBER,NORMAL,SOFT,Reliance Jio (broadband bill)
+TATASKY,NORMAL,SOFT,Tata Sky DTH (SOFT — could be GST vendor payment)
+BSNL,NORMAL,SOFT,Bharat Sanchar Nigam Limited
+# ── Banks / NBFCs (SOFT — loan EMIs, credit card bills) ────────────────────
+HDFC BANK EMI,NORMAL,SOFT,HDFC Home/Auto/Personal Loan EMI
+ICICI BANK EMI,NORMAL,SOFT,ICICI Bank Loan EMI
+BAJAJ FINANCE,NORMAL,SOFT,Bajaj Finance EMI
+# ── Government / Statutory ──────────────────────────────────────────────────
+EPFO,NORMAL,HARD,Employee Provident Fund Organisation
+ESIC,NORMAL,HARD,Employee State Insurance Corporation
+NPS TRUST,NORMAL,HARD,National Pension Scheme Trust
+POST OFFICE,NORMAL,HARD,India Post — savings / RD / PPF

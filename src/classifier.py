@@ -12,7 +12,6 @@ from src.scorer import score_transaction
 from utils.helpers import normalize_text
 import pandas as pd
 
-
 def classify_transaction(text: str) -> str:
     """
     Classify a single narration string → 'TDS', 'GST', 'NORMAL', or 'UNCERTAIN'.
@@ -25,3 +24,4 @@ def classify_transaction(text: str) -> str:
         "_date":   None,
     })
     return score_transaction(row).category
+    

@@ -30,7 +30,7 @@ if str(_project_root) not in sys.path:
 from src.loader import load_excel
 from src.scorer import score_transaction
 from utils.constants import (
-    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN,
+    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST,
     INTERNAL_COLS,
 )
 from utils.helpers import normalize_columns
@@ -43,7 +43,7 @@ DEFAULT_EVAL_OUTPUT = "data/output/evaluation_results.xlsx"
 ACTUAL_COL          = "Actual_Category"
 PREDICTED_COL       = "Predicted_Category"
 CORRECT_COL         = "Correct"
-ALL_CATEGORIES      = [CATEGORY_TDS, CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_UNCERTAIN]
+ALL_CATEGORIES      = [CATEGORY_TDS, CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_NORMAL, CATEGORY_UNCERTAIN]
 
 # Excel fill colours
 _FILL_CORRECT = PatternFill(fill_type="solid", fgColor="FFD9EAD3")  # soft green
@@ -120,7 +120,11 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     df = df.copy()
     # Coerce to str first to handle any mixed-dtype edge cases
     df[PREDICTED_COL] = df[PREDICTED_COL].astype(str).str.upper()
-    df[CORRECT_COL]   = df[ACTUAL_COL] == df[PREDICTED_COL]
+    
+    # Treat POSSIBLE_GST as correct if actual is GST (sub-category match)
+    df[CORRECT_COL] = (df[ACTUAL_COL] == df[PREDICTED_COL]) | (
+        (df[ACTUAL_COL] == CATEGORY_GST) & (df[PREDICTED_COL] == CATEGORY_POSSIBLE_GST)
+    )
 
     total    = len(df)
     correct  = int(df[CORRECT_COL].sum())

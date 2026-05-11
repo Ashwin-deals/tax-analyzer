@@ -29,7 +29,7 @@ if str(_root) not in sys.path:
 from src.loader import load_excel
 from src.processor import process_transactions
 from utils.constants import (
-    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN,
+    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST,
 )
 from utils.email_utils import is_configured, load_credentials, mask_email
 
@@ -78,6 +78,7 @@ st.markdown("""
 
     .card-total   { border-left-color: #6366f1; }  .card-total   .value { color: #6366f1; }
     .card-gst     { border-left-color: #22c55e; }  .card-gst     .value { color: #22c55e; }
+    .card-possible_gst { border-left-color: #84cc16; } .card-possible_gst .value { color: #84cc16; }
     .card-tds     { border-left-color: #f59e0b; }  .card-tds     .value { color: #f59e0b; }
     .card-normal  { border-left-color: #3b82f6; }  .card-normal  .value { color: #3b82f6; }
     .card-uncertain { border-left-color: #9ca3af; } .card-uncertain .value { color: #9ca3af; }
@@ -170,14 +171,27 @@ def _render_tab(df: pd.DataFrame, category: str, download_name: str):
     if "Debit" in df.columns:
         c2.metric("Total Debit (₹)", f"{pd.to_numeric(df['Debit'], errors='coerce').sum():,.2f}")
     if review_count:
-        c3.metric("⚠️ Needs Review", review_count)
+        c3.metric("⚠️ Review Recommended", review_count)
 
     st.divider()
 
-    hide = {"Needs_Review", "_description", "_debit", "_credit", "_date"}
+    hide = {"_description", "_debit", "_credit", "_date"}
     show_cols = [c for c in df.columns if c not in hide]
-    st.dataframe(df[show_cols], use_container_width=True,
-                 height=min(600, max(200, (len(df) + 1) * 36)))
+
+    col_cfg = {}
+    if "Reason" in show_cols:
+        col_cfg["Reason"] = st.column_config.TextColumn(
+            "Reason", width="large",
+            help="Signal chain that led to this classification"
+        )
+    if "Needs_Review" in show_cols:
+        col_cfg["Needs_Review"] = st.column_config.CheckboxColumn(
+            "Review Recommended", help="Review recommendations are advisory and usually occur for heuristic or medium-confidence classifications."
+        )
+
+    st.dataframe(df[show_cols], width="stretch",
+                 height=min(600, max(200, (len(df) + 1) * 36)),
+                 column_config=col_cfg)
 
     st.divider()
     st.download_button(
@@ -190,28 +204,30 @@ def _render_tab(df: pd.DataFrame, category: str, download_name: str):
 
 def _render_results(result: dict, source_label: str):
     """Render the full classification output: success banner, cards, tabs."""
-    gst_df       = result.get(CATEGORY_GST,      pd.DataFrame())
-    tds_df       = result.get(CATEGORY_TDS,      pd.DataFrame())
-    normal_df    = result.get(CATEGORY_NORMAL,   pd.DataFrame())
-    uncertain_df = result.get(CATEGORY_UNCERTAIN, pd.DataFrame())
-    total        = len(gst_df) + len(tds_df) + len(normal_df) + len(uncertain_df)
+    gst_df          = result.get(CATEGORY_GST,          pd.DataFrame())
+    possible_gst_df = result.get(CATEGORY_POSSIBLE_GST, pd.DataFrame())
+    tds_df          = result.get(CATEGORY_TDS,          pd.DataFrame())
+    normal_df       = result.get(CATEGORY_NORMAL,       pd.DataFrame())
+    uncertain_df    = result.get(CATEGORY_UNCERTAIN,    pd.DataFrame())
+    total           = len(gst_df) + len(possible_gst_df) + len(tds_df) + len(normal_df) + len(uncertain_df)
 
     st.success(f"✅ Classified **{total:,} transactions** from `{source_label}`")
     st.divider()
 
     # Summary cards
     st.markdown("### 📊 Classification Summary")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.markdown(_card("Total",     total,           "card-total"),     unsafe_allow_html=True)
     c2.markdown(_card("GST",       len(gst_df),     "card-gst"),       unsafe_allow_html=True)
-    c3.markdown(_card("TDS",       len(tds_df),     "card-tds"),       unsafe_allow_html=True)
-    c4.markdown(_card("Normal",    len(normal_df),  "card-normal"),    unsafe_allow_html=True)
-    c5.markdown(_card("Uncertain", len(uncertain_df), "card-uncertain"), unsafe_allow_html=True)
+    c3.markdown(_card("Poss GST",  len(possible_gst_df), "card-possible_gst"), unsafe_allow_html=True)
+    c4.markdown(_card("TDS",       len(tds_df),     "card-tds"),       unsafe_allow_html=True)
+    c5.markdown(_card("Normal",    len(normal_df),  "card-normal"),    unsafe_allow_html=True)
+    c6.markdown(_card("Uncertain", len(uncertain_df), "card-uncertain"), unsafe_allow_html=True)
 
     st.divider()
 
     # Review banner
-    all_dfs = [gst_df, tds_df, normal_df, uncertain_df]
+    all_dfs = [gst_df, possible_gst_df, tds_df, normal_df, uncertain_df]
     review_total = sum(
         int(df["Needs_Review"].sum())
         for df in all_dfs
@@ -219,22 +235,24 @@ def _render_results(result: dict, source_label: str):
     )
     if review_total:
         st.warning(
-            f"⚠️ **{review_total} transactions** flagged for manual review. "
-            "Check the **Needs_Review** column in each tab."
+            f"⚠️ **Global Review Total: {review_total} transactions** across all categories are suggested for manual verification. "
+            "Review recommendations are advisory and usually occur for UNCERTAIN, LOW-confidence, or ambiguous close-call classifications."
         )
 
     # Result tabs
     st.markdown("### 📋 Classified Transactions")
-    t_gst, t_tds, t_normal, t_uncertain = st.tabs([
+    t_gst, t_pgst, t_tds, t_normal, t_uncertain = st.tabs([
         f"🟢  GST  ({len(gst_df):,})",
+        f"🟩  POSSIBLE GST  ({len(possible_gst_df):,})",
         f"🟡  TDS  ({len(tds_df):,})",
         f"🔵  NORMAL  ({len(normal_df):,})",
         f"⚪  UNCERTAIN  ({len(uncertain_df):,})",
     ])
-    with t_gst:      _render_tab(gst_df,       "GST",       "gst_transactions.xlsx")
-    with t_tds:      _render_tab(tds_df,       "TDS",       "tds_transactions.xlsx")
-    with t_normal:   _render_tab(normal_df,    "NORMAL",    "normal_transactions.xlsx")
-    with t_uncertain: _render_tab(uncertain_df, "UNCERTAIN", "uncertain_transactions.xlsx")
+    with t_gst:      _render_tab(gst_df,          "GST",          "gst_transactions.xlsx")
+    with t_pgst:     _render_tab(possible_gst_df, "POSSIBLE GST", "possible_gst_transactions.xlsx")
+    with t_tds:      _render_tab(tds_df,          "TDS",          "tds_transactions.xlsx")
+    with t_normal:   _render_tab(normal_df,       "NORMAL",       "normal_transactions.xlsx")
+    with t_uncertain: _render_tab(uncertain_df,   "UNCERTAIN",    "uncertain_transactions.xlsx")
 
 
 def _run_pipeline(file_path: Path) -> dict:
@@ -393,12 +411,13 @@ EMAIL_PASSWORD=your_16_char_app_password</code>
 
         if not downloaded:
             st.warning(
-                "📭 No statement attachments found in your recent emails.\n\n"
+                "📭 No statement attachments found in your unread emails.\n\n"
                 "**Check:**\n"
-                "- Your bank emails the statement with subject containing "
-                "'statement', 'bank statement', 'account statement', or 'monthly statement'\n"
+                "- The statement email is **unread** in Gmail — already-read emails are skipped\n"
+                "- The subject contains 'statement', 'bank statement', 'account statement', "
+                "or 'monthly statement'\n"
                 "- The attachment is a `.xlsx` or `.xls` file\n"
-                "- IMAP access is enabled in your Gmail settings"
+                "- IMAP access is enabled in Gmail → Settings → Forwarding and POP/IMAP"
             )
             st.stop()
 

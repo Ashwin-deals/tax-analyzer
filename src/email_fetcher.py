@@ -110,20 +110,27 @@ def _search_statement_emails(
     limit: int,
 ) -> list[bytes]:
     """
-    Search INBOX using each SUBJECT_KEYWORD and collect unique message IDs.
-    Returns the `limit` most-recent IDs (highest UID = most recent).
+    Search INBOX for UNREAD emails whose subject matches any SUBJECT_KEYWORD.
+
+    Only unseen (unread) messages are returned. Once an email is fetched
+    via RFC822, Gmail automatically marks it as \\Seen, so subsequent runs
+    will not re-download the same statement.
+
+    Returns the `limit` most-recent matched message IDs (descending order).
     """
     matched: set[bytes] = set()
 
     for keyword in SUBJECT_KEYWORDS:
         try:
-            _, data = conn.search(None, f'SUBJECT "{keyword}"')
+            # UNSEEN restricts to unread emails only
+            _, data = conn.search(None, f'UNSEEN SUBJECT "{keyword}"')
             if data and data[0]:
                 for mid in data[0].split():
                     matched.add(mid)
         except imaplib.IMAP4.error as exc:
             logger.warning("IMAP search failed for keyword '%s': %s", keyword, exc)
 
+    logger.info("Unread statement emails found: %d", len(matched))
     # Sort descending so most-recent emails come first
     sorted_ids = sorted(matched, key=lambda x: int(x), reverse=True)
     return sorted_ids[:limit]
