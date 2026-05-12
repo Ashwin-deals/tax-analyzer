@@ -7,7 +7,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from src.loader import load_excel
 from src.scorer import score_transaction
-from utils.constants import CATEGORY_GST, CATEGORY_TDS, CATEGORY_NORMAL, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT
+from utils.constants import CATEGORY_GST, CATEGORY_TDS, CATEGORY_NORMAL, CATEGORY_POSSIBLE_GST
 
 GOLD_DATASET_PATH = Path(__file__).resolve().parent / "gold_dataset.xlsx"
 
@@ -30,8 +30,10 @@ def evaluate_gold_dataset():
     df['review_recommended'] = [r.needs_review for r in score_results]
     df['actual_category'] = df['Actual_Category']
     
-    # Accuracy Tracking (Accept POSSIBLE_GST and BUSINESS_PAYMENT as valid for GST to reflect semantic separation)
-    correct_mask = (df['predicted_category'] == df['actual_category']) | (df['predicted_category'].isin([CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT]) & (df['actual_category'] == CATEGORY_GST))
+    gst_compatible = [CATEGORY_GST, CATEGORY_POSSIBLE_GST]
+
+    # Accuracy Tracking (Accept POSSIBLE_GST as valid for GST in legacy labels)
+    correct_mask = (df['predicted_category'] == df['actual_category']) | (df['predicted_category'].isin(gst_compatible) & (df['actual_category'] == CATEGORY_GST))
     correct = correct_mask.sum()
     accuracy = correct / len(df)
     
@@ -44,11 +46,11 @@ def evaluate_gold_dataset():
     print("-------------------------------------------------------")
     for target_cat in [CATEGORY_GST, CATEGORY_TDS]:
         if target_cat == CATEGORY_GST:
-            # Treat POSSIBLE_GST and BUSINESS_PAYMENT as valid sub-categories of GST for evaluation against legacy labels
-            true_pos = len(df[df['predicted_category'].isin([CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT]) & (df['actual_category'] == CATEGORY_GST)])
-            false_pos = len(df[df['predicted_category'].isin([CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT]) & (df['actual_category'] != CATEGORY_GST)])
-            false_neg = len(df[~df['predicted_category'].isin([CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT]) & (df['actual_category'] == CATEGORY_GST)])
-            true_neg = len(df[~df['predicted_category'].isin([CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT]) & (df['actual_category'] != CATEGORY_GST)])
+            # Treat POSSIBLE_GST as a valid GST-compatible class for legacy labels.
+            true_pos = len(df[df['predicted_category'].isin(gst_compatible) & (df['actual_category'] == CATEGORY_GST)])
+            false_pos = len(df[df['predicted_category'].isin(gst_compatible) & (df['actual_category'] != CATEGORY_GST)])
+            false_neg = len(df[~df['predicted_category'].isin(gst_compatible) & (df['actual_category'] == CATEGORY_GST)])
+            true_neg = len(df[~df['predicted_category'].isin(gst_compatible) & (df['actual_category'] != CATEGORY_GST)])
         else:
             true_pos = len(df[(df['predicted_category'] == target_cat) & (df['actual_category'] == target_cat)])
             false_pos = len(df[(df['predicted_category'] == target_cat) & (df['actual_category'] != target_cat)])
@@ -67,7 +69,7 @@ def evaluate_gold_dataset():
     # Confusion Summary
     print("🔍 CONFUSION SUMMARY (Misclassifications)")
     print("-------------------------------------------------------")
-    misclassified = df[(df['predicted_category'] != df['actual_category']) & ~(df['predicted_category'].isin([CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT]) & (df['actual_category'] == CATEGORY_GST))]
+    misclassified = df[(df['predicted_category'] != df['actual_category']) & ~(df['predicted_category'].isin([CATEGORY_POSSIBLE_GST]) & (df['actual_category'] == CATEGORY_GST))]
     if not misclassified.empty:
         confusion = misclassified.groupby(['actual_category', 'predicted_category']).size().reset_index(name='count')
         for _, row in confusion.iterrows():

@@ -15,34 +15,53 @@ INTERNAL_COLS = [INTERNAL_DESCRIPTION_COL, INTERNAL_DEBIT_COL,
 DESCRIPTION_COLUMN_CANDIDATES = [
     "particulars", "narration", "description", "remarks",
     "transaction details", "details", "transaction narration", "reference",
+    # ICICI / IDFC style
+    "transaction remarks", "tran remarks", "txn remarks",
+    # Other bank formats
+    "chq / ref no", "chq/ref", "transaction description", "beneficiary",
+    "payment details", "memo", "note",
 ]
 DEBIT_COLUMN_CANDIDATES = [
     "debit", "withdrawal", "withdrawal amt.", "withdrawal amt",
     "debit amt", "debit amt.", "dr amount", "dr amt",
+    # Variants with parenthetical suffixes or typos (e.g. ICICI 'Withdra wal (Dr)')
+    "withdrawal (dr)", "withdra wal (dr)", "withdrawl (dr)", "withdraw (dr)",
+    "debit (dr)", "dr)", "amount (dr)", "wdl (dr)",
+    # Other banks
+    "amount debited", "debit amount",
 ]
 CREDIT_COLUMN_CANDIDATES = [
     "credit", "deposit", "deposit amt.", "deposit amt",
     "credit amt", "credit amt.", "cr amount", "cr amt",
+    # Variants with parenthetical suffixes (e.g. ICICI 'Deposit (Cr)')
+    "deposit (cr)", "credit (cr)", "cr)", "amount (cr)",
+    # Other banks
+    "amount credited", "credit amount",
 ]
 DATE_COLUMN_CANDIDATES = [
     "transaction date", "date", "value date", "txn date", "posting date",
 ]
 
-# ── Categories ────────────────────────────────────────────────────────────────
-CATEGORY_TDS       = "TDS"
-CATEGORY_GST = "GST"
+# ── Categories (TAX_CATEGORY) ──────────────────────────────────────────────────
+# Final tax interpretation values. Flow/business semantics live in FLOW_TYPE,
+# not in the tax category.
+CATEGORY_TDS          = "TDS"
+CATEGORY_GST          = "GST"
 CATEGORY_POSSIBLE_GST = "POSSIBLE_GST"
-CATEGORY_BUSINESS_PAYMENT = "BUSINESS_PAYMENT"
-CATEGORY_NORMAL    = "NORMAL"
-CATEGORY_UNCERTAIN = "UNCERTAIN"
+CATEGORY_NORMAL       = "NORMAL"
 
-# Thresholds recalibrated: UNCERTAIN only fires when BOTH scores carry meaningful
-# competing signals (tds > 0 AND gst > 0, or one score in 4–7 range).
-# Score 0–3 on both → NORMAL (not UNCERTAIN).
+# Legacy label retained only so older evaluation files can be read safely.
+# The scorer should not emit this as a final TAX_CATEGORY.
+CATEGORY_UNCERTAIN    = "UNCERTAIN"
+TAX_CATEGORY_ORDER    = [CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_TDS, CATEGORY_NORMAL]
+
+# Thresholds for explicit classifications, ambiguous POSSIBLE_GST, and review
+# routing. Competing signals are handled through Review_Recommended instead of
+# emitting a separate UNCERTAIN tax category.
 SCORE_HIGH_THRESHOLD     = 8    # ≥ 8  → HIGH confidence, direct classification
 SCORE_MEDIUM_THRESHOLD   = 3    # ≥ 3  → MEDIUM confidence, classifiable
-SCORE_UNCERTAIN_CUTOFF   = 4    # raised: score 1–3 → NORMAL, score 4–7 → UNCERTAIN
-SCORE_CLOSE_CALL_MARGIN  = 2    # TDS/GST within this margin → Needs_Review
+SCORE_UNCERTAIN_CUTOFF   = 4    # competing signals above this threshold trigger review
+SCORE_CLOSE_CALL_MARGIN  = 2    # TDS/GST within this margin -> Review_Recommended
 
 # ── TDS signal weights ────────────────────────────────────────────────────────
 SCORE_TDS_KEYWORD        = 10
@@ -54,8 +73,8 @@ SCORE_TDS_QUARTER_END    = 1    # Reduced: timing alone can't elevate category
 SCORE_GST_KEYWORD        = 10
 SCORE_GST_GSTIN_PATTERN  = 9
 SCORE_GST_WEAK_HINT      = 4    # Weak hint (invoice, settlement, accounting)
-SCORE_GST_GATEWAY        = 3    # Reduced: gateway alone → BUSINESS_PAYMENT, not POSSIBLE_GST
-SCORE_GST_CMS_CARDPMT    = 2    # Reduced: card payment → BUSINESS_PAYMENT unless other signals
+SCORE_GST_GATEWAY        = 3    # Gateway/commercial infra -> POSSIBLE_GST when tax is ambiguous
+SCORE_GST_CMS_CARDPMT    = 2    # Card/CMS is behavioral context, not a final tax category
 SCORE_GST_UPI_DEBIT      = 1    # Reduced: UPI debit alone is insufficient for tax ambiguity
 SCORE_GST_NONROUND_AMT   = 2
 
@@ -182,6 +201,18 @@ GST_WEAK_HINTS = [
     "invoice", "bill payment", "settlement", "accounting", "expense"
 ]
 
+# ── Service/vendor semantic intelligence (→ FLOW_TYPE BUSINESS + POSSIBLE_GST) ─
+SERVICE_VENDOR_KEYWORDS = [
+    "service", "services", "service charge", "maintenance", "repair",
+    "engineering", "engineerin", "consulting", "consultancy", "consultant",
+    "professional fee", "professional services", "retainer", "audit",
+    "accounting", "bookkeeping", "legal services", "ca services",
+    "software", "software license", "license fee", "saas",
+    "cloud", "hosting", "server", "domain", "it support", "support fee",
+    "vendor payment", "supplier payment", "contractor", "freelancer",
+    "agency", "logistics", "courier", "procurement",
+]
+
 # ── Merchant / payment-gateway keywords (→ GST) ───────────────────────────────
 MERCHANT_KEYWORDS = [
     "card pmt", "card payment", "credit card pmt", "debit card pmt",
@@ -197,9 +228,7 @@ CATEGORY_COLOURS = {
     CATEGORY_TDS:          "FFFFC000",  # amber
     CATEGORY_GST:          "FF70AD47",  # green
     CATEGORY_POSSIBLE_GST: "FFA9D08E",  # light green
-    CATEGORY_BUSINESS_PAYMENT: "FFFFD966",  # light orange/yellow
     CATEGORY_NORMAL:       "FF4472C4",  # blue
-    CATEGORY_UNCERTAIN:    "FFD9D9D9",  # light grey
     "SUMMARY":             "FF7030A0",  # purple
 }
 
@@ -209,9 +238,7 @@ DEFAULT_OUTPUT_DIR = "data/output"
 OUTPUT_FILENAMES = {
     CATEGORY_GST:          "gst_transactions.xlsx",
     CATEGORY_POSSIBLE_GST: "possible_gst_transactions.xlsx",
-    CATEGORY_BUSINESS_PAYMENT: "business_payment_transactions.xlsx",
     CATEGORY_TDS:          "tds_transactions.xlsx",
     CATEGORY_NORMAL:       "normal_transactions.xlsx",
-    CATEGORY_UNCERTAIN:    "uncertain_transactions.xlsx",
 }
 SUMMARY_FILENAME = "classification_summary.xlsx"

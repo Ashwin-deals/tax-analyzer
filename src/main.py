@@ -43,7 +43,7 @@ def _configure_logging(verbose: bool) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="tax-analyzer",
-        description="Classify bank statement transactions into GST, TDS, or NORMAL.",
+        description="Interpret bank statement transactions with flow behavior and tax category.",
     )
     parser.add_argument(
         "input_file",
@@ -93,21 +93,21 @@ def main() -> None:
     logger.info("Step 2/3 — Classifying transactions …")
     result = process_transactions(df)
 
-    gst_count       = len(result.get("GST", []))
-    tds_count       = len(result.get("TDS", []))
-    normal_count    = len(result.get("NORMAL", []))
-    uncertain_count = len(result.get("UNCERTAIN", []))
+    gst_count          = len(result.get("GST", []))
+    possible_gst_count = len(result.get("POSSIBLE_GST", []))
+    tds_count          = len(result.get("TDS", []))
+    normal_count       = len(result.get("NORMAL", []))
 
     # Calculate review needs across all categories
-    total_review = sum(df["Needs_Review"].sum() for df in result.values() if not df.empty)
+    total_review = sum(df["REVIEW_RECOMMENDED"].sum() for df in result.values() if not df.empty)
 
     print(f"\n🔍 Classification results:")
-    print(f"   • GST       : {gst_count:>5,} transactions")
-    print(f"   • TDS       : {tds_count:>5,} transactions")
-    print(f"   • NORMAL    : {normal_count:>5,} transactions")
-    print(f"   • UNCERTAIN : {uncertain_count:>5,} transactions")
+    print(f"   • GST          : {gst_count:>5,} transactions")
+    print(f"   • POSSIBLE_GST : {possible_gst_count:>5,} transactions")
+    print(f"   • TDS          : {tds_count:>5,} transactions")
+    print(f"   • NORMAL       : {normal_count:>5,} transactions")
     print(f"   {'─' * 30}")
-    print(f"   • TOTAL     : {gst_count + tds_count + normal_count + uncertain_count:>5,} transactions")
+    print(f"   • TOTAL        : {gst_count + possible_gst_count + tds_count + normal_count:>5,} transactions")
     print(f"\n🚩 Review required for {int(total_review):,} transactions.")
 
     # ── Step 3: Export ────────────────────────────────────────────────────────

@@ -69,7 +69,7 @@ def load_excel(file_path: str | Path) -> pd.DataFrame:
     if desc_col is None:
         logger.warning(
             "No recognisable description column found. "
-            "All transactions will be NORMAL/UNCERTAIN. Columns: %s", list(df.columns),
+            "All transactions will be interpreted with low textual context. Columns: %s", list(df.columns),
         )
     else:
         logger.info("Using '%s' as the description column.", desc_col)

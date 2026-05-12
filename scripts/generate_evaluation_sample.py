@@ -21,7 +21,7 @@ sys.path.insert(0, str(_project_root))
 import pandas as pd
 from src.loader import load_excel
 from src.scorer import score_transaction
-from utils.constants import INTERNAL_COLS
+from utils.constants import INTERNAL_COLS, TAX_CATEGORY_ORDER
 
 DEFAULT_INPUT  = "data/input/bank_statement.xlsx"
 DEFAULT_OUTPUT = "data/input/evaluation_sample.xlsx"
@@ -59,7 +59,7 @@ def main() -> None:
         parts = []
         per_cat = max(1, args.size // 4)
 
-        for cat in ["GST", "TDS", "NORMAL", "UNCERTAIN"]:
+        for cat in TAX_CATEGORY_ORDER:
             cat_df = df[df["Predicted_Suggestion"] == cat]
             n = min(per_cat, len(cat_df))
             if n > 0:
@@ -91,7 +91,7 @@ def main() -> None:
     print(f"   Predicted distribution: {dist}")
     print(f"\n⚠️  Next steps:")
     print(f"   1. Open '{output_path.name}' in Excel")
-    print(f"   2. Fill the 'Actual_Category' column for each row (GST / TDS / NORMAL)")
+    print(f"   2. Fill the 'Actual_Category' column for each row (GST / POSSIBLE_GST / TDS / NORMAL)")
     print(f"   3. Save and run: python3 src/evaluator.py")
 
 

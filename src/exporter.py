@@ -3,8 +3,8 @@ src/exporter.py
 ───────────────
 Writes per-category Excel files and a classification summary workbook.
 
-Now exports four files: GST, TDS, NORMAL, UNCERTAIN (Fix #11).
-Summary includes Needs_Review counts and Confidence breakdown.
+Exports the final TAX_CATEGORY files: GST, POSSIBLE_GST, TDS, NORMAL.
+Summary includes review counts and confidence breakdown.
 """
 
 import logging
@@ -17,8 +17,8 @@ from openpyxl.utils import get_column_letter
 
 from utils.constants import (
     CATEGORY_COLOURS, CATEGORY_GST, CATEGORY_NORMAL,
-    CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT,
-    DEFAULT_OUTPUT_DIR, OUTPUT_FILENAMES, SUMMARY_FILENAME,
+    CATEGORY_TDS, CATEGORY_POSSIBLE_GST,
+    DEFAULT_OUTPUT_DIR, OUTPUT_FILENAMES, SUMMARY_FILENAME, TAX_CATEGORY_ORDER,
 )
 from utils.helpers import build_summary
 
@@ -36,7 +36,7 @@ def export_data(
     Parameters
     ----------
     data_dict : dict[str, pd.DataFrame]
-        Keys: 'GST', 'TDS', 'NORMAL', 'UNCERTAIN'.
+        Keys: 'GST', 'POSSIBLE_GST', 'TDS', 'NORMAL'.
     output_folder : str | Path
         Destination directory (created if missing).
     include_summary : bool
@@ -47,7 +47,7 @@ def export_data(
 
     exported: list[tuple[str, int]] = []
 
-    for category in [CATEGORY_TDS, CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT, CATEGORY_NORMAL, CATEGORY_UNCERTAIN]:
+    for category in TAX_CATEGORY_ORDER:
         df = data_dict.get(category, pd.DataFrame())
         filename = OUTPUT_FILENAMES[category]
         dest = out_dir / filename

@@ -17,7 +17,7 @@ from utils.constants import (
     INTERNAL_DEBIT_COL,
     INTERNAL_CREDIT_COL,
     INTERNAL_DATE_COL,
-    CATEGORY_TDS, CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_UNCERTAIN,
+    TAX_CATEGORY_ORDER,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,11 +48,31 @@ def normalize_text(text) -> str:
 # ── Column detection ──────────────────────────────────────────────────────────
 
 def detect_description_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """Return the first matching column name (case-insensitive) or None."""
+    """
+    Return the first matching column name (case-insensitive) or None.
+
+    Two-pass strategy:
+      1. Exact match (normalised lower-strip)
+      2. Substring match: candidate appears inside column name
+         e.g. candidate='withdrawal' matches column 'Withdra wal (Dr)' after
+         stripping spaces from both sides.
+    """
     lower_map = {c.lower().strip(): c for c in df.columns}
+
+    # Pass 1: exact match
     for candidate in candidates:
         if candidate.lower() in lower_map:
             return lower_map[candidate.lower()]
+
+    # Pass 2: candidate is a substring of the column name (after removing spaces)
+    # This handles typo-space columns like 'Withdra wal (Dr)' matching 'withdrawal'
+    for candidate in candidates:
+        cand_nospace = candidate.lower().replace(" ", "")
+        for col_lower, col_original in lower_map.items():
+            col_nospace = col_lower.replace(" ", "")
+            if cand_nospace in col_nospace:
+                return col_original
+
     return None
 
 
@@ -107,13 +127,22 @@ def safe_numeric(series: pd.Series) -> pd.Series:
 def build_summary(classified_df: pd.DataFrame) -> pd.DataFrame:
     """Build a per-category summary with counts, totals, and review flags."""
     rows = []
-    order = {CATEGORY_TDS: 0, CATEGORY_GST: 1, CATEGORY_NORMAL: 2, CATEGORY_UNCERTAIN: 3}
+    order = {category: idx for idx, category in enumerate(TAX_CATEGORY_ORDER)}
+    if "TAX_CATEGORY" in classified_df.columns:
+        category_col = "TAX_CATEGORY"
+    else:
+        category_col = "Tax_Category" if "Tax_Category" in classified_df.columns else "Category"
 
-    for category, group in classified_df.groupby("Category", sort=False):
+    if "REVIEW_RECOMMENDED" in classified_df.columns:
+        review_col = "REVIEW_RECOMMENDED"
+    else:
+        review_col = "Review_Recommended" if "Review_Recommended" in classified_df.columns else "Needs_Review"
+
+    for category, group in classified_df.groupby(category_col, sort=False):
         row: dict = {
-            "Category":           category,
+            "Tax Category":       category,
             "Transaction Count":  len(group),
-            "Needs Review Count": int(group.get("Needs_Review", pd.Series([False] * len(group))).sum()),
+            "Review Count":       int(group.get(review_col, pd.Series([False] * len(group))).sum()),
         }
         for col in ["Debit", "Credit", "Amount", "Withdrawal Amt.", "Deposit Amt."]:
             matched = [c for c in group.columns if c.strip().lower() == col.strip().lower()]
@@ -122,6 +151,6 @@ def build_summary(classified_df: pd.DataFrame) -> pd.DataFrame:
         rows.append(row)
 
     summary_df = pd.DataFrame(rows)
-    summary_df["_order"] = summary_df["Category"].map(order).fillna(99)
+    summary_df["_order"] = summary_df["Tax Category"].map(order).fillna(99)
     summary_df = summary_df.sort_values("_order").drop(columns=["_order"])
     return summary_df.reset_index(drop=True)

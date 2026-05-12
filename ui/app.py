@@ -29,8 +29,7 @@ if str(_root) not in sys.path:
 from src.loader import load_excel
 from src.processor import process_transactions
 from utils.constants import (
-    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST,
-    CATEGORY_BUSINESS_PAYMENT,
+    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_POSSIBLE_GST,
 )
 from utils.email_utils import is_configured, load_credentials, mask_email
 
@@ -137,7 +136,7 @@ st.markdown("""
 st.markdown("""
 <div class="app-header">
     <h1>🏦 Bank Statement Analyzer</h1>
-    <p>Classify transactions into GST · TDS · NORMAL — upload manually or fetch directly from Gmail</p>
+    <p>Explainable financial transaction intelligence: flow behavior plus GST · POSSIBLE GST · TDS · NORMAL tax interpretation</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -166,7 +165,13 @@ def _render_tab(df: pd.DataFrame, category: str, download_name: str):
         st.info(f"No {category} transactions found.")
         return
 
-    review_count = int(df["Needs_Review"].sum()) if "Needs_Review" in df.columns else 0
+    if "REVIEW_RECOMMENDED" in df.columns:
+        review_col = "REVIEW_RECOMMENDED"
+    elif "Review_Recommended" in df.columns:
+        review_col = "Review_Recommended"
+    else:
+        review_col = "Needs_Review"
+    review_count = int(df[review_col].sum()) if review_col in df.columns else 0
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Transactions", f"{len(df):,}")
@@ -177,18 +182,40 @@ def _render_tab(df: pd.DataFrame, category: str, download_name: str):
 
     st.divider()
 
-    hide = {"_description", "_debit", "_credit", "_date"}
+    hide = {"_description", "_debit", "_credit", "_date", "FLOW_TYPE", "Flow_Type"}
     show_cols = [c for c in df.columns if c not in hide]
 
+    ml_col = "ML_ASSIST" if "ML_ASSIST" in show_cols else "ML_Assist" if "ML_Assist" in show_cols else None
+    if ml_col and not df[ml_col].replace("N/A", pd.NA).dropna().any():
+        show_cols.remove(ml_col)
+
+    # Reorder around the simplified semantic output columns.
+    priority_cols = ["TAX_CATEGORY", "CONFIDENCE", "REVIEW_RECOMMENDED",
+                     "ML_ASSIST", "REASON"]
+    ordered = [c for c in priority_cols if c in show_cols]
+    rest = [c for c in show_cols if c not in priority_cols]
+    show_cols = rest[:3] + ordered + rest[3:]  # keep narration/date/amount first
+
     col_cfg = {}
-    if "Reason" in show_cols:
-        col_cfg["Reason"] = st.column_config.TextColumn(
+    if "REASON" in show_cols:
+        col_cfg["REASON"] = st.column_config.TextColumn(
             "Reason", width="large",
-            help="Signal chain that led to this classification"
+            help="Signal chain that led to the classification"
         )
-    if "Needs_Review" in show_cols:
-        col_cfg["Needs_Review"] = st.column_config.CheckboxColumn(
-            "Review Recommended", help="Review recommendations are advisory and usually occur for heuristic or medium-confidence classifications."
+    if "REVIEW_RECOMMENDED" in show_cols:
+        col_cfg["REVIEW_RECOMMENDED"] = st.column_config.CheckboxColumn(
+            "Review Recommended",
+            help="Advisory flag for ambiguous, low-confidence, or ML-uncertain classifications."
+        )
+    if "TAX_CATEGORY" in show_cols:
+        col_cfg["TAX_CATEGORY"] = st.column_config.TextColumn(
+            "Tax Category", width="medium",
+            help="Tax interpretation: GST, POSSIBLE_GST, TDS, or NORMAL."
+        )
+    if "ML_ASSIST" in show_cols:
+        col_cfg["ML_ASSIST"] = st.column_config.TextColumn(
+            "ML Assist", width="small",
+            help="Calibrated ML probability shown only when ML changed the tax interpretation"
         )
 
     st.dataframe(df[show_cols], width="stretch",
@@ -208,57 +235,49 @@ def _render_results(result: dict, source_label: str):
     """Render the full classification output: success banner, cards, tabs."""
     gst_df           = result.get(CATEGORY_GST,              pd.DataFrame())
     possible_gst_df  = result.get(CATEGORY_POSSIBLE_GST,     pd.DataFrame())
-    biz_pay_df       = result.get(CATEGORY_BUSINESS_PAYMENT, pd.DataFrame())
     tds_df           = result.get(CATEGORY_TDS,              pd.DataFrame())
     normal_df        = result.get(CATEGORY_NORMAL,           pd.DataFrame())
-    uncertain_df     = result.get(CATEGORY_UNCERTAIN,        pd.DataFrame())
-    total = len(gst_df) + len(possible_gst_df) + len(biz_pay_df) + len(tds_df) + len(normal_df) + len(uncertain_df)
+    total = len(gst_df) + len(possible_gst_df) + len(tds_df) + len(normal_df)
 
     st.success(f"✅ Classified **{total:,} transactions** from `{source_label}`")
     st.divider()
 
-    # Summary cards (7 columns)
+    # Summary cards
     st.markdown("### 📊 Classification Summary")
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.markdown(_card("Total",        total,                "card-total"),          unsafe_allow_html=True)
     c2.markdown(_card("GST",          len(gst_df),          "card-gst"),            unsafe_allow_html=True)
     c3.markdown(_card("Poss GST",     len(possible_gst_df), "card-possible_gst"),   unsafe_allow_html=True)
-    c4.markdown(_card("Biz Payment",  len(biz_pay_df),      "card-business_payment"), unsafe_allow_html=True)
-    c5.markdown(_card("TDS",          len(tds_df),          "card-tds"),            unsafe_allow_html=True)
-    c6.markdown(_card("Normal",       len(normal_df),       "card-normal"),         unsafe_allow_html=True)
-    c7.markdown(_card("Uncertain",    len(uncertain_df),    "card-uncertain"),      unsafe_allow_html=True)
+    c4.markdown(_card("TDS",          len(tds_df),          "card-tds"),            unsafe_allow_html=True)
+    c5.markdown(_card("Normal",       len(normal_df),       "card-normal"),         unsafe_allow_html=True)
 
     st.divider()
 
     # Review banner
-    all_dfs = [gst_df, possible_gst_df, biz_pay_df, tds_df, normal_df, uncertain_df]
+    all_dfs = [gst_df, possible_gst_df, tds_df, normal_df]
     review_total = sum(
-        int(df["Needs_Review"].sum())
+        int(df["REVIEW_RECOMMENDED"].sum())
         for df in all_dfs
-        if not df.empty and "Needs_Review" in df.columns
+        if not df.empty and "REVIEW_RECOMMENDED" in df.columns
     )
     if review_total:
         st.warning(
             f"⚠️ **Global Review Total: {review_total} transactions** across all categories are suggested for manual verification. "
-            "Review recommendations are advisory and usually occur for UNCERTAIN, LOW-confidence, or ambiguous close-call classifications."
+            "Review recommendations are advisory and usually occur for LOW-confidence or ambiguous classifications."
         )
 
     # Result tabs
     st.markdown("### 📋 Classified Transactions")
-    t_gst, t_pgst, t_biz, t_tds, t_normal, t_uncertain = st.tabs([
+    t_gst, t_pgst, t_tds, t_normal = st.tabs([
         f"🟢  GST  ({len(gst_df):,})",
         f"🟩  POSSIBLE GST  ({len(possible_gst_df):,})",
-        f"🟠  BUSINESS PAYMENT  ({len(biz_pay_df):,})",
         f"🟡  TDS  ({len(tds_df):,})",
         f"🔵  NORMAL  ({len(normal_df):,})",
-        f"⚪  UNCERTAIN  ({len(uncertain_df):,})",
     ])
     with t_gst:      _render_tab(gst_df,          "GST",              "gst_transactions.xlsx")
     with t_pgst:     _render_tab(possible_gst_df, "POSSIBLE GST",     "possible_gst_transactions.xlsx")
-    with t_biz:      _render_tab(biz_pay_df,      "BUSINESS PAYMENT", "business_payment_transactions.xlsx")
     with t_tds:      _render_tab(tds_df,          "TDS",              "tds_transactions.xlsx")
     with t_normal:   _render_tab(normal_df,       "NORMAL",           "normal_transactions.xlsx")
-    with t_uncertain: _render_tab(uncertain_df,   "UNCERTAIN",        "uncertain_transactions.xlsx")
 
 def _update_learning_memory(pattern: str, category: str):
     import csv
@@ -294,7 +313,7 @@ def _update_learning_memory(pattern: str, category: str):
             with col1:
                 vendor_input = st.text_input("Vendor Pattern (e.g., 'RAZORPAY', 'SWIGGY', 'TNEB')", help="A unique word or phrase found in the transaction narration.")
             with col2:
-                corrected_cat = st.selectbox("Correct Category", ["NORMAL", "GST", "POSSIBLE_GST", "BUSINESS_PAYMENT", "TDS"])
+                corrected_cat = st.selectbox("Correct Tax Category", ["NORMAL", "GST", "POSSIBLE_GST", "TDS"])
             
             if st.form_submit_button("Train System"):
                 if vendor_input.strip():

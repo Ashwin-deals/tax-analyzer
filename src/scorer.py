@@ -13,9 +13,9 @@ Architecture (v3):
   7. Negative penalties        — soft subtraction from both scores
   8. Company suffix penalties  — TDS-only subtraction
   9. Direction penalty         — incoming credits penalised
- 10. Category decision         — HIGH > MEDIUM > SOFT GST > UNCERTAIN > NORMAL
-     UNCERTAIN only fires when BOTH scores ≥ SCORE_UNCERTAIN_CUTOFF
- 11. Reason string             — human-readable explanation in every result
+ 10. Flow classification       — behavior only: CONSUMER/BUSINESS/etc.
+ 11. Tax category decision     — GST / POSSIBLE_GST / TDS / NORMAL
+ 12. Reason string             — human-readable explanation in every result
 """
 
 import csv
@@ -26,12 +26,21 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.flow_classifier import (
+    FLOW_BUSINESS,
+    FLOW_CONSUMER,
+    FLOW_SETTLEMENT,
+    FLOW_SUBSCRIPTION,
+    FLOW_TAX,
+    FLOW_TRANSFER,
+    classify_flow,
+)
 from src.parser import TxType, parse_transaction_type
 from utils.constants import (
     AMOUNT_FLAG_ABOVE, AMOUNT_IGNORE_BELOW,
-    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_UNCERTAIN, CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT,
+    CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_POSSIBLE_GST,
     COMPANY_SUFFIX_PENALTIES,
-    GST_KEYWORDS, GST_WEAK_HINTS, MERCHANT_KEYWORDS, NEGATIVE_KEYWORDS,
+    GST_KEYWORDS, GST_WEAK_HINTS, MERCHANT_KEYWORDS, NEGATIVE_KEYWORDS, SERVICE_VENDOR_KEYWORDS,
     NORMAL_OVERRIDE_KEYWORDS,
     INTERNAL_CREDIT_COL, INTERNAL_DATE_COL,
     INTERNAL_DEBIT_COL, INTERNAL_DESCRIPTION_COL,
@@ -72,6 +81,7 @@ _RE_GST_KEYWORDS: list[tuple[str, re.Pattern]] = [
 _RE_GSTIN = re.compile(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][Z][A-Z0-9]\b")
 
 _MERCHANT_SET = set(MERCHANT_KEYWORDS)
+_SERVICE_VENDOR_SET = set(SERVICE_VENDOR_KEYWORDS)
 
 _NEGATIVE_PATTERNS: list[tuple[re.Pattern, int]] = [
     (re.compile(p if is_re else re.escape(p), re.IGNORECASE), pen)
@@ -90,10 +100,17 @@ _NORMAL_OVERRIDE_PATTERNS: list[re.Pattern] = [
 ]
 
 # Strong GST keywords that block TDS priority and (when present) bypass
-# NORMAL overrides (e.g. "TNEB GST PAYMENT" must stay GST, not become NORMAL)
-_STRONG_GST_KWS = {"igst", "cgst", "sgst", "utgst", "gst payment",
-                   "gst challan", "gst refund"}
-# Strong TDS keywords that block NORMAL overrides
+# NORMAL overrides and the amount-threshold guard.
+# Bare 'gst' is intentionally included so narrations like '+GST' or 'Mob alrt+GST'
+# are never silently skipped by the sub-₹1 amount filter.
+_STRONG_GST_KWS = {
+    "gst",            # catches '+GST', 'GST applicable', 'GST charges' etc.
+    "igst", "cgst", "sgst", "utgst",
+    "gstin",
+    "gst payment", "gst challan", "gst refund",
+    "tax invoice", "gst invoice",
+}
+# Strong TDS keywords that block NORMAL overrides and amount-threshold guard
 _STRONG_TDS_KWS = {"tds", "tax deducted", "income tax", "tcs", "it refund"}
 
 _QUARTER_END_MONTHS = {3, 6, 9, 12}
@@ -112,8 +129,8 @@ def _load_vendor_intelligence() -> list[dict]:
     with csv_path.open(newline="", encoding="utf-8") as fh:
         reader = csv.DictReader((line for line in fh if not line.lstrip().startswith("#")))
         for row in reader:
-            pattern = row.get("vendor_pattern", "").strip().lower()
-            cat = row.get("learned_category", "").strip().upper()
+            pattern = (row.get("vendor_pattern") or row.get("pattern") or "").strip().lower()
+            cat = (row.get("learned_category") or row.get("category") or "").strip().upper()
             conf = row.get("confidence", "MEDIUM").strip().upper()
             if pattern and cat:
                 intel.append({"pattern": pattern, "category": cat, "confidence": conf})
@@ -179,16 +196,24 @@ class ScoreResult:
     normalized_text: str = ""
     ml_assist_score: float = 0.0
     ml_model_confidence: float = 0.0
+    ml_assist_used: bool = False
+    ml_uncertain: bool = False
+    ambiguous_semantics: bool = False
+    deterministic_normal: bool = False
+    explicit_rule: bool = False
+    flow_type:    str  = "UNKNOWN"
+    flow_confidence: str = "LOW"
+    flow_reason:  str  = ""
+    is_commercial_flow: bool = False
     debug_parts:  list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
-            "Category":     self.category,
-            "Confidence":   self.confidence,
-            "Mode":         self.classification_mode,
-            "Needs_Review": self.needs_review,
-            "Reason":       self.reason,
-            "ML_Assist":    f"{self.ml_model_confidence:.2%}" if self.classification_mode == "ML_ASSISTED" else "N/A"
+            "TAX_CATEGORY":       self.category,
+            "CONFIDENCE":         self.confidence,
+            "REVIEW_RECOMMENDED": self.needs_review,
+            "ML_ASSIST":          f"{self.ml_model_confidence:.2%}" if self.ml_assist_used else "N/A",
+            "REASON":             self.reason,
         }
 
 
@@ -208,17 +233,32 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     credit = _safe_float(row.get(INTERNAL_CREDIT_COL))
     date   = row.get(INTERNAL_DATE_COL)
     amount = debit if debit > 0 else credit
+    result.normalized_text = text
+
+    # ── Transaction type ──────────────────────────────────────────────────────
+    tx_type = parse_transaction_type(text)
+    result.transaction_type = tx_type.name if hasattr(tx_type, 'name') else str(tx_type)
+
+    # ── Explicit tax pre-check (before ALL other logic) ──────────────────────
+    # Must happen BEFORE the amount threshold guard.
+    # Narrations containing explicit GST/TDS evidence must NEVER be silently
+    # discarded because of a sub-₹1 amount filter.
+    _text_early = normalize_text(row.get(INTERNAL_DESCRIPTION_COL, ""))
+    _has_explicit_gst = any(kw in _text_early for kw in _STRONG_GST_KWS)
+    _has_explicit_tds = any(kw in _text_early for kw in _STRONG_TDS_KWS)
 
     # ── Amount sanity ─────────────────────────────────────────────────────────
-    if 0 < amount < AMOUNT_IGNORE_BELOW:
-        dbg.append(f"amount ₹{amount} < ₹{AMOUNT_IGNORE_BELOW} → skip scoring")
-        return _finalise(result, debit, credit, amount, dbg)
+    # Exception: if explicit tax keywords are present, bypass the amount filter.
+    # Sub-₹1 bank charges with '+GST' are real tax events even if tiny.
+    if 0 < amount < AMOUNT_IGNORE_BELOW and not (_has_explicit_gst or _has_explicit_tds):
+        dbg.append(f"amount ₹{amount} < ₹{AMOUNT_IGNORE_BELOW} → skip scoring (no explicit tax keyword)")
+        return _finalise(result, debit, credit, amount, dbg, date)
 
-    # ── Probe for strong tax keywords (used by override bypass logic) ─────────
-    has_strong_gst = any(kw in text for kw in _STRONG_GST_KWS)
-    has_strong_tds = any(kw in text for kw in _STRONG_TDS_KWS)
-    
+    # ── Probe for strong tax keywords (reuse pre-check already done above) ─────
+    has_strong_gst = _has_explicit_gst
+    has_strong_tds = _has_explicit_tds
     result.classification_mode = "EXPLICIT" if (has_strong_gst or has_strong_tds) else "HEURISTIC"
+    result.explicit_rule = has_strong_gst or has_strong_tds
 
     # ── NORMAL override: utility / statutory payments ─────────────────────────
     # If a utility keyword matches AND no strong GST/TDS keyword is present,
@@ -228,22 +268,21 @@ def score_transaction(row: pd.Series) -> ScoreResult:
             if pat.search(text):
                 dbg.append(f"Statutory/utility payment detected")
                 result.category = CATEGORY_NORMAL
-                return _finalise(result, debit, credit, amount, dbg)
+                result.deterministic_normal = True
+                return _finalise(result, debit, credit, amount, dbg, date)
 
     # ── Salary credit hard override ───────────────────────────────────────────
     _SALARY_SIGNALS = ("salary", "net salary", "payroll", "wages")
     if credit > 0 and debit == 0 and any(s in text for s in _SALARY_SIGNALS):
         dbg.append("Salary credit detected")
         result.category = CATEGORY_NORMAL
-        return _finalise(result, debit, credit, amount, dbg)
-
-    # ── Transaction type ──────────────────────────────────────────────────────
-    tx_type = parse_transaction_type(text)
-    result.transaction_type = tx_type.name if hasattr(tx_type, 'name') else str(tx_type)
+        result.deterministic_normal = True
+        return _finalise(result, debit, credit, amount, dbg, date)
 
     if tx_type == TxType.ATM_WITHDRAWAL:
         dbg.append("ATM withdrawal detected")
-        return _finalise(result, debit, credit, amount, dbg)
+        result.deterministic_normal = True
+        return _finalise(result, debit, credit, amount, dbg, date)
 
     # ── Vendor Intelligence Layer ─────────────────────────────────────────────
     # Applied after ATM/salary hard overrides but BEFORE scoring.
@@ -251,9 +290,10 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     intel_conf = None
     intel_pattern = None
     is_learned = False
+    intel_flow_hint = None
 
     for vi in _VENDOR_INTELLIGENCE:
-        if vi["pattern"] in text:
+        if _vendor_pattern_matches(vi["pattern"], text):
             intel_pattern = vi["pattern"]
             intel_cat = vi["category"]
             intel_conf = vi["confidence"]
@@ -276,16 +316,14 @@ def score_transaction(row: pd.Series) -> ScoreResult:
             if is_learned:
                 result.classification_mode = "LEARNED"
             dbg.append("Known non-tax vendor matched")
-            return _finalise(result, debit, credit, amount, dbg)
+            result.deterministic_normal = True
+            return _finalise(result, debit, credit, amount, dbg, date)
         # MEDIUM confidence NORMAL deferred to end of scoring
         
-    if intel_cat == CATEGORY_BUSINESS_PAYMENT:
-        if intel_conf == "HIGH" and not has_strong_gst and not has_strong_tds:
-            result.category = CATEGORY_BUSINESS_PAYMENT
-            if is_learned:
-                result.classification_mode = "LEARNED"
-            dbg.append("Known business/merchant payment vendor matched")
-            return _finalise(result, debit, credit, amount, dbg)
+    if intel_cat in {"BUSINESS_PAYMENT", "BUSINESS_EXPENSE", "VENDOR_PAYMENT"}:
+        intel_flow_hint = FLOW_BUSINESS
+        dbg.append("Vendor intelligence provides business-flow context (not a tax category)")
+        intel_cat = None
 
     # ── TDS scoring ───────────────────────────────────────────────────────────
     tds = 0
@@ -294,6 +332,7 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         if pattern.search(text):
             tds += SCORE_TDS_KEYWORD
             result.classification_mode = "EXPLICIT"
+            result.explicit_rule = True
             dbg.append("Explicit TDS keyword found")
             break  # count once
 
@@ -302,6 +341,7 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         if match:
             matched_code = match.group(0).upper()
             result.classification_mode = "EXPLICIT"
+            result.explicit_rule = True
             if "194A" in matched_code:
                 tds += 6
                 dbg.append("TDS section 194A detected")
@@ -316,6 +356,7 @@ def score_transaction(row: pd.Series) -> ScoreResult:
         if _RE_SECTION_CONTEXT.search(text):
             tds += SCORE_TDS_SECTION_CODE
             result.classification_mode = "EXPLICIT"
+            result.explicit_rule = True
             dbg.append("Contextual TDS section code detected")
 
     # Bare section code (194/195/206) — no debit condition required anymore
@@ -338,12 +379,16 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     if _RE_GSTIN.search(text.upper()):
         gst += SCORE_GST_GSTIN_PATTERN
         result.classification_mode = "EXPLICIT"
+        result.explicit_rule = True
+        has_strong_gst = True
         dbg.append("Explicit GSTIN pattern detected")
 
     for kw, pattern in _RE_GST_KEYWORDS:
         if pattern.search(text):
             gst += SCORE_GST_KEYWORD
             result.classification_mode = "EXPLICIT"
+            result.explicit_rule = True
+            has_strong_gst = True
             dbg.append(f"Explicit GST keyword found: {kw}")
             break
             
@@ -355,7 +400,16 @@ def score_transaction(row: pd.Series) -> ScoreResult:
             break
 
     # Apply Vendor Intelligence Bias
-    if intel_cat == CATEGORY_POSSIBLE_GST:
+    if intel_cat == CATEGORY_GST:
+        if is_learned:
+            result.classification_mode = "LEARNED"
+            gst += 8
+        elif intel_conf == "HIGH":
+            gst += 8
+        else:
+            gst += 4
+        dbg.append(f"Vendor intelligence applied {intel_conf} GST bias")
+    elif intel_cat == CATEGORY_POSSIBLE_GST:
         if is_learned:
             result.classification_mode = "LEARNED"
             gst += 8
@@ -401,97 +455,171 @@ def score_transaction(row: pd.Series) -> ScoreResult:
     gst = max(0, gst + neg)
 
     # ── Direction penalty — incoming credits ──────────────────────────────────
+    # Exception: commercial settlement infrastructure (escrow, aggregator, gateway)
+    # must NOT have their score zeroed by the credit penalty — the penalty exists
+    # to block P2P/personal credits, not commercial revenue flows.
     is_incoming = (credit > 0 and debit == 0)
-    if is_incoming:
+    is_infra_credit = is_incoming and any(
+        kw in text for kw in [
+            "payment aggregator", "escrow", "merchant settlement",
+            "cms_", "setdt-", "mid-", "aggregator", "acquiring",
+            "razorpay", "cashfree", "payu", "ccavenue", "easebuzz", "billdesk",
+        ]
+    )
+    if is_incoming and not is_infra_credit:
         is_refund = "refund" in text
         if not (is_refund and gst > 0):
             gst = max(0, gst + PENALTY_INCOMING_GST)
             dbg.append("Incoming credit penalty applied to GST")
-        
-        # Exception: if we found strong TDS keywords/sections, do not penalize
         if not (tds >= 8 or is_refund):
             tds = max(0, tds + PENALTY_INCOMING_TDS)
             dbg.append("Incoming credit penalty applied to TDS")
+    elif is_infra_credit:
+        dbg.append("Incoming credit penalty SKIPPED — commercial settlement infrastructure detected")
+
+    # ── Flow Type Classification ───────────────────────────────────────────────
+    # FLOW_TYPE is behavioral context only. It informs ambiguity, but never
+    # becomes a TAX_CATEGORY.
+    flow = classify_flow(
+        text=text,
+        debit=debit,
+        credit=credit,
+        amount=amount,
+        tx_type_name=result.transaction_type,
+        date=date,
+        vendor=result.vendor,
+    )
+    if intel_flow_hint and flow.flow_type not in (FLOW_CONSUMER, FLOW_TAX):
+        flow.flow_type = FLOW_SETTLEMENT if credit > 0 and debit == 0 else FLOW_BUSINESS
+        flow.is_commercial = True
+        flow.flow_reason = "Vendor intelligence marked this as commercial flow"
+
+    result.flow_type          = flow.flow_type
+    result.flow_confidence    = flow.flow_confidence
+    result.flow_reason        = flow.flow_reason
+    result.is_commercial_flow = flow.is_commercial
+
+    # ── Service/vendor semantic intelligence ──────────────────────────────────
+    # Business/service semantics increase POSSIBLE_GST likelihood, but never
+    # upgrade to definite GST without explicit GST evidence.
+    has_service_vendor_hint = (
+        debit > 0
+        and flow.flow_type in (FLOW_BUSINESS, FLOW_SUBSCRIPTION)
+        and flow.flow_type != FLOW_CONSUMER
+        and _has_service_vendor_signal(text)
+    )
+    if has_service_vendor_hint and not has_strong_gst:
+        gst += SCORE_GST_WEAK_HINT
+        result.ambiguous_semantics = True
+        dbg.append("Service/vendor business semantics → POSSIBLE_GST candidate")
 
     result.tds_score = tds
     result.gst_score = gst
 
     # ── Category decision ─────────────────────────────────────────────────────
-    # Priority 1: Strong TDS — unless a primary GST keyword present
-    if tds >= SCORE_HIGH_THRESHOLD and not has_strong_gst:
+    # Priority 1: Explicit GST dominates all other semantics.
+    if has_strong_gst or (_RE_GSTIN.search(text.upper())):
+        result.category = CATEGORY_GST
+        result.classification_mode = "EXPLICIT"
+        result.explicit_rule = True
+        dbg.append("Explicit GST evidence → GST")
+
+    # Priority 2: Strong TDS — unless explicit GST is present.
+    elif tds >= SCORE_HIGH_THRESHOLD and not has_strong_gst:
         result.category = CATEGORY_TDS
         dbg.append(f"TDS high tds={tds} ≥ {SCORE_HIGH_THRESHOLD}")
 
-    # Priority 2: High-confidence GST
-    elif gst >= SCORE_HIGH_THRESHOLD:
-        result.category = CATEGORY_GST
-        dbg.append(f"GST high gst={gst}")
-
-    # Priority 3: Medium TDS wins over medium GST
+    # Priority 3: Medium TDS wins over weaker GST when no explicit GST exists.
     elif tds >= SCORE_MEDIUM_THRESHOLD and tds >= gst:
         result.category = CATEGORY_TDS
         dbg.append(f"TDS medium tds={tds}")
 
-    # Priority 4: Medium GST
+    # Priority 4: Heuristic GST evidence is ambiguous tax interpretation.
     elif gst >= SCORE_MEDIUM_THRESHOLD:
-        result.category = CATEGORY_GST
-        dbg.append(f"GST medium gst={gst}")
+        result.category = CATEGORY_POSSIBLE_GST
+        result.ambiguous_semantics = True
+        dbg.append(f"POSSIBLE_GST — heuristic GST/business signals gst={gst}")
 
-    # Priority 5: Soft GST — positive GST score, no competing TDS
-    elif gst > 0:
-        result.category = CATEGORY_GST
-        dbg.append(f"GST soft gst={gst}")
-
-    # Priority 6: UNCERTAIN — ONLY when BOTH scores have meaningful competing
-    # signals (both ≥ SCORE_UNCERTAIN_CUTOFF). Avoids false UNCERTAIN for
-    # low-signal transactions that should simply be NORMAL.
+    # Priority 5: Close-call tax ambiguity stays in the nearest tax category and
+    # is surfaced through REVIEW_RECOMMENDED, not a separate UNCERTAIN category.
     elif tds >= SCORE_UNCERTAIN_CUTOFF and gst >= SCORE_UNCERTAIN_CUTOFF:
-        result.category = CATEGORY_UNCERTAIN
-        dbg.append(f"UNCERTAIN — competing signals tds={tds} gst={gst}")
+        result.category = CATEGORY_TDS if tds >= gst else CATEGORY_POSSIBLE_GST
+        result.ambiguous_semantics = True
+        dbg.append(f"Competing tax signals tds={tds} gst={gst}")
 
-    # Priority 7: Soft vendor override (SOFT priority, no strong tax signal)
+    # Priority 6: Commercial flow backstop. This preserves business/settlement
+    # understanding as POSSIBLE_GST without creating business-shaped tax labels.
+    elif flow.is_commercial and flow.flow_type in (FLOW_BUSINESS, FLOW_SETTLEMENT, FLOW_SUBSCRIPTION):
+        result.category = CATEGORY_POSSIBLE_GST
+        result.ambiguous_semantics = True
+        dbg.append(f"Commercial flow semantics → POSSIBLE_GST candidate (flow={flow.flow_type})")
+
+    # Priority 7: Soft vendor override (SOFT priority, no strong tax signal).
     elif intel_cat == CATEGORY_NORMAL and intel_conf == "MEDIUM":
         result.category = CATEGORY_NORMAL
+        result.deterministic_normal = True
         dbg.append("MEDIUM vendor intelligence override applied → NORMAL")
 
     # Default: no meaningful signals → NORMAL
     else:
         result.category = CATEGORY_NORMAL
+        result.deterministic_normal = flow.flow_type in (FLOW_CONSUMER, FLOW_TRANSFER) or (tds == 0 and gst == 0)
         dbg.append(f"NORMAL — no signals tds={tds} gst={gst}")
 
-    return _finalise(result, debit, credit, amount, dbg)
+    return _finalise(result, debit, credit, amount, dbg, date)
 
 
-# ── Finalise: confidence + Needs_Review + Reason ─────────────────────────────
+# ── Finalise: confidence + Review_Recommended + Reason ───────────────────────
 
 def _finalise(result: ScoreResult, debit: float, credit: float,
-              amount: float, dbg: list) -> ScoreResult:
+              amount: float, dbg: list, date=None) -> ScoreResult:
     tds, gst = result.tds_score, result.gst_score
     top = max(tds, gst)
 
-    # Confidence
-    if top >= SCORE_HIGH_THRESHOLD:
+    # Ensure early-return paths still carry FLOW_TYPE. Flow is behavioral context
+    # and does not alter the tax category by itself.
+    if not result.flow_reason:
+        flow = classify_flow(
+            text=result.normalized_text,
+            debit=debit,
+            credit=credit,
+            amount=amount,
+            tx_type_name=result.transaction_type,
+            date=date,
+            vendor=result.vendor,
+        )
+        result.flow_type          = flow.flow_type
+        result.flow_confidence    = flow.flow_confidence
+        result.flow_reason        = flow.flow_reason
+        result.is_commercial_flow = flow.is_commercial
+
+    # Confidence represents overall classification certainty, not a duplicate
+    # flow confidence signal.
+    if result.explicit_rule or result.classification_mode == "EXPLICIT":
         result.confidence = "HIGH"
-    elif top >= SCORE_MEDIUM_THRESHOLD:
+    elif result.deterministic_normal and result.category == CATEGORY_NORMAL:
+        result.confidence = "HIGH"
+    elif result.category == CATEGORY_POSSIBLE_GST:
+        result.confidence = "MEDIUM" if top >= SCORE_MEDIUM_THRESHOLD or result.is_commercial_flow else "LOW"
+    elif top >= SCORE_HIGH_THRESHOLD:
+        result.confidence = "HIGH"
+    elif top >= SCORE_MEDIUM_THRESHOLD or result.is_commercial_flow:
         result.confidence = "MEDIUM"
     else:
         result.confidence = "LOW"
 
-    # ── Map Heuristic GST to BUSINESS_PAYMENT or POSSIBLE_GST ─────────────────
-    if result.category == CATEGORY_GST and result.classification_mode == "HEURISTIC":
-        has_weak_hint = any("Weak GST/tax hint found" in d for d in dbg)
-        has_tax_vendor = any("Vendor intelligence" in d and "POSSIBLE_GST" in d for d in dbg)
-        
-        if has_weak_hint or has_tax_vendor:
-            result.category = CATEGORY_POSSIBLE_GST
-        else:
-            result.category = CATEGORY_BUSINESS_PAYMENT
-
     # ── ML Assistance Layer ───────────────────────────────────────────────────
-    # Apply ML model ONLY for ambiguous HEURISTIC cases
-    is_ambiguous = (result.category in (CATEGORY_POSSIBLE_GST, CATEGORY_BUSINESS_PAYMENT, CATEGORY_NORMAL)) and (result.classification_mode == "HEURISTIC")
-    
-    if is_ambiguous and ML_MODEL is not None and ML_VEC is not None:
+    # ML may intervene only for ambiguous heuristic NORMAL/POSSIBLE_GST cases.
+    # Explicit rules and deterministic classifications stay fully rule-owned.
+    ml_eligible = (
+        result.classification_mode == "HEURISTIC"
+        and not result.explicit_rule
+        and not result.deterministic_normal
+        and result.category in (CATEGORY_NORMAL, CATEGORY_POSSIBLE_GST)
+        and (result.ambiguous_semantics or result.confidence in ("LOW", "MEDIUM"))
+    )
+
+    if ml_eligible and ML_MODEL is not None and ML_VEC is not None:
         try:
             texts = [result.normalized_text]
             X_text = ML_VEC.transform(texts).toarray()
@@ -499,41 +627,53 @@ def _finalise(result: ScoreResult, debit: float, credit: float,
             X = np.hstack((X_text, X_num))
             
             pred_prob = ML_MODEL.predict_proba(X)[0]
-            ml_pred = CATEGORY_POSSIBLE_GST if ML_MODEL.predict(X)[0] == 1 else CATEGORY_NORMAL
-            ml_conf = float(pred_prob.max())
-            
-            result.ml_model_confidence = ml_conf
-            
-            # Strict Intervention Gating
-            # BUSINESS_PAYMENT is owned by the rule engine — ML must never override it
-            if result.category == CATEGORY_BUSINESS_PAYMENT:
-                dbg.append(f"ML Layer: NO_OVERRIDE (Rule owns BUSINESS_PAYMENT; ML={ml_pred} @ {ml_conf:.2%})")
-            elif ml_conf < 0.85:
-                dbg.append("ML Layer: NO_OVERRIDE (Low Confidence)")
-            elif (ml_pred != result.category
-                  and ml_conf > 0.90
-                  and result.confidence in ("LOW", "MEDIUM")
-                  and result.category == CATEGORY_NORMAL):
-                # Only allow NORMAL → POSSIBLE_GST promotion
-                dbg.append(f"ML Override: {result.category} → {ml_pred} (ML Conf: {ml_conf:.2%})")
-                result.category = ml_pred
-            else:
-                if ml_pred == result.category and ml_conf > 0.80:
-                    dbg.append(f"ML Confirmed: {ml_pred} (ML Conf: {ml_conf:.2%})")
+            classes = list(getattr(ML_MODEL, "classes_", [0, 1]))
+            probs = {cls: float(prob) for cls, prob in zip(classes, pred_prob)}
+            possible_prob = probs.get(1, float(pred_prob[-1]))
+            normal_prob = probs.get(0, float(pred_prob[0]))
+            ml_pred = CATEGORY_POSSIBLE_GST if possible_prob >= normal_prob else CATEGORY_NORMAL
+            ml_conf = max(possible_prob, normal_prob)
+
+            if ml_conf < 0.70:
+                result.ml_uncertain = True
+                dbg.append("ML uncertainty on ambiguous transaction")
+            elif (
+                result.category == CATEGORY_NORMAL
+                and ml_pred == CATEGORY_POSSIBLE_GST
+                and possible_prob >= 0.78
+            ):
+                result.category = CATEGORY_POSSIBLE_GST
+                result.classification_mode = "ML_ASSISTED"
+                result.ml_assist_used = True
+                result.ml_model_confidence = possible_prob
+                result.confidence = "HIGH" if possible_prob >= 0.92 else "MEDIUM"
+                result.ambiguous_semantics = True
+                dbg.append(f"ML assisted ambiguity resolution → POSSIBLE_GST ({possible_prob:.2%})")
+            elif result.category == CATEGORY_POSSIBLE_GST and ml_pred == CATEGORY_NORMAL and normal_prob >= 0.78:
+                result.ml_uncertain = True
+                dbg.append("ML disagreed with heuristic POSSIBLE_GST")
         except Exception as e:
-            pass
+            logger.debug("ML assistance skipped: %s", e)
 
-    # Needs_Review
-    # Trigger ONLY if:
-    # 1. Multiple competing signals (UNCERTAIN)
-    # 2. Medium confidence with a small score gap
-    is_tax = result.category in (CATEGORY_GST, CATEGORY_POSSIBLE_GST, CATEGORY_TDS)
+    # Review_Recommended
+    # Explicit GST/TDS and deterministic NORMAL do not require review. Low
+    # confidence, ambiguous service/vendor semantics, and ML uncertainty do.
     score_gap = abs(tds - gst)
-
-    result.needs_review = (
-        result.category == CATEGORY_UNCERTAIN
-        or (is_tax and (result.confidence == "LOW" or (result.confidence == "MEDIUM" and score_gap <= SCORE_CLOSE_CALL_MARGIN)))
-    )
+    if result.explicit_rule and result.category in (CATEGORY_GST, CATEGORY_TDS):
+        result.needs_review = False
+    elif result.category == CATEGORY_NORMAL and result.deterministic_normal:
+        result.needs_review = False
+    else:
+        result.needs_review = (
+            result.confidence == "LOW"
+            or result.ambiguous_semantics
+            or result.ml_uncertain
+            or (
+                result.category in (CATEGORY_POSSIBLE_GST, CATEGORY_TDS)
+                and result.confidence == "MEDIUM"
+                and score_gap <= SCORE_CLOSE_CALL_MARGIN
+            )
+        )
 
     # ── Reason string — human-readable, pipe-separated signal list ────────────
     # Clean up empty strings and remove duplicates while preserving order
@@ -555,10 +695,26 @@ def _finalise(result: ScoreResult, debit: float, credit: float,
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 def _safe_float(val) -> float:
-    """Convert val to float, returning 0.0 for None / NaN / unconvertible values."""
+    """
+    Convert val to float, returning 0.0 for None / NaN / unconvertible values.
+
+    Handles:
+    - Indian comma-formatted amounts: '1,00,000.00'
+    - Multiline Excel cells: '1,00,000.\\n00' (ICICI bank format)
+    - Regular numeric strings: '35000', '2950.50'
+    """
+    if val is None:
+        return 0.0
     try:
         v = float(val)
         return 0.0 if v != v else v   # v != v is True only for NaN
+    except (TypeError, ValueError):
+        pass
+    # String cleaning: strip whitespace (including \n), remove Indian-style commas
+    try:
+        cleaned = str(val).replace("\n", "").replace("\r", "").replace(",", "").strip()
+        v = float(cleaned)
+        return 0.0 if v != v else v
     except (TypeError, ValueError):
         return 0.0
 
@@ -577,6 +733,16 @@ def _is_quarter_end(date_val) -> bool:
         return pd.notna(parsed) and parsed.month in _QUARTER_END_MONTHS
     except Exception:
         return False
+
+
+def _has_service_vendor_signal(text: str) -> bool:
+    return any(signal in text for signal in _SERVICE_VENDOR_SET)
+
+
+def _vendor_pattern_matches(pattern: str, text: str) -> bool:
+    if len(pattern) <= 3 and pattern.replace("_", "").isalnum():
+        return re.search(rf"(?<![a-z0-9]){re.escape(pattern)}(?![a-z0-9])", text) is not None
+    return pattern in text
 
 
 def _negative_penalty(text: str, dbg: list) -> int:

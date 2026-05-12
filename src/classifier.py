@@ -14,7 +14,7 @@ import pandas as pd
 
 def classify_transaction(text: str) -> str:
     """
-    Classify a single narration string → 'TDS', 'GST', 'NORMAL', or 'UNCERTAIN'.
+    Classify a single narration string → GST, POSSIBLE_GST, TDS, or NORMAL.
     Uses the full scoring engine (direction-neutral; no debit/credit context).
     """
     row = pd.Series({
