@@ -8,6 +8,8 @@ Usage
     # From the project root:
     python -m src.main                                  # uses default path
     python -m src.main data/input/my_statement.xlsx    # custom path
+    python -m src.main data/input/my_statement.csv
+    python -m src.main data/input/my_statement.pdf
     python -m src.main --help
 """
 
@@ -22,7 +24,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from src.exporter import export_data
-from src.loader import load_excel
+from src.loader import load_statement
 from src.processor import process_transactions
 from utils.constants import DEFAULT_INPUT_PATH, DEFAULT_OUTPUT_DIR
 
@@ -49,7 +51,7 @@ def _parse_args() -> argparse.Namespace:
         "input_file",
         nargs="?",
         default=DEFAULT_INPUT_PATH,
-        help=f"Path to the bank statement .xlsx file (default: {DEFAULT_INPUT_PATH})",
+        help=f"Path to the bank statement file: xlsx, xls, csv, or pdf (default: {DEFAULT_INPUT_PATH})",
     )
     parser.add_argument(
         "--output-dir",
@@ -86,7 +88,7 @@ def main() -> None:
 
     # ── Step 1: Load ──────────────────────────────────────────────────────────
     logger.info("Step 1/3 — Loading data from: %s", input_path)
-    df = load_excel(input_path)
+    df = load_statement(input_path)
     print(f"\n📂 Loaded {len(df):,} rows from '{input_path.name}'")
 
     # ── Step 2: Process / Classify ────────────────────────────────────────────

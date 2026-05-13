@@ -19,7 +19,7 @@ _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root))
 
 import pandas as pd
-from src.loader import load_excel
+from src.loader import load_statement
 from src.scorer import score_transaction
 from utils.constants import INTERNAL_COLS, TAX_CATEGORY_ORDER
 
@@ -45,7 +45,7 @@ def main() -> None:
     output_path = (_project_root / args.output).resolve()
 
     print(f"Loading: {input_path}")
-    df = load_excel(input_path)
+    df = load_statement(input_path)
 
     # Run classifier to add suggestion column
     score_results = df.apply(score_transaction, axis=1)

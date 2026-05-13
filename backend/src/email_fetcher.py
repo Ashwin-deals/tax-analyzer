@@ -2,7 +2,7 @@
 src/email_fetcher.py
 ────────────────────
 Connects to Gmail via IMAP, finds emails likely containing bank statements,
-downloads .xlsx/.xls attachments, and returns their local paths.
+downloads statement attachments, and returns their local paths.
 
 No credentials are hardcoded. All secrets are loaded from .env via
 utils/email_utils.py.
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 IMAP_HOST        = "imap.gmail.com"
 IMAP_PORT        = 993
-VALID_EXTENSIONS = {".xlsx", ".xls"}           # .pdf reserved for Phase 2
+VALID_EXTENSIONS = {".xlsx", ".xls", ".csv", ".pdf"}
 
 # Subject keywords used to identify statement emails (case-insensitive OR)
 SUBJECT_KEYWORDS = [
@@ -51,7 +51,7 @@ def fetch_statements(
     max_emails: int = 20,
 ) -> list[Path]:
     """
-    Connect to Gmail, search for statement emails, download xlsx attachments.
+    Connect to Gmail, search for statement emails, download statement attachments.
 
     Args:
         email_address: Gmail address (from .env).
@@ -171,7 +171,7 @@ def _download_attachments(
     output_dir: Path,
 ) -> list[Path]:
     """
-    Fetch a single email, extract valid statement attachments (.xlsx/.xls),
+    Fetch a single email, extract valid statement attachments,
     and write them to output_dir. Returns list of saved Paths.
     """
     try:

@@ -27,7 +27,7 @@ _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.loader import load_excel
+from src.loader import load_statement
 from src.scorer import score_transaction
 from utils.constants import (
     CATEGORY_GST, CATEGORY_NORMAL, CATEGORY_TDS, CATEGORY_POSSIBLE_GST,
@@ -63,7 +63,7 @@ def load_evaluation_file(file_path: Path) -> pd.DataFrame:
     if not file_path.exists():
         sys.exit(f"[ERROR] Evaluation file not found: {file_path}")
 
-    df = load_excel(file_path)
+    df = load_statement(file_path)
 
     if ACTUAL_COL not in df.columns:
         sys.exit(

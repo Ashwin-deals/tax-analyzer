@@ -1,111 +1,64 @@
-# Bank Statement GST & TDS Classifier
+# Tax Analyzer
 
-A modular Python tool that reads a bank statement `.xlsx` file and automatically classifies every transaction as **GST**, **TDS**, or **NORMAL**, then exports separate Excel files for each category.
-
----
-
-## Project Structure
+Production-style full-stack transaction intelligence app.
 
 ```
 tax-analyzer/
-├── data/
-│   ├── input/              ← place your bank_statement.xlsx here
-│   └── output/             ← generated files land here
-├── scripts/
-│   └── generate_sample_data.py   ← create test data
-├── src/
-│   ├── __init__.py
-│   ├── main.py             ← CLI entry point
-│   ├── loader.py           ← Excel loading + header detection
-│   ├── classifier.py       ← keyword-based classification logic
-│   ├── processor.py        ← orchestrates classify + split
-│   └── exporter.py         ← writes formatted Excel output
-├── utils/
-│   ├── __init__.py
-│   ├── constants.py        ← all keywords and config
-│   └── helpers.py          ← shared utility functions
-├── requirements.txt
-└── README.md
+├── backend/   # FastAPI API + existing Python classification/ML/export logic
+└── frontend/  # Vite + React + TailwindCSS dashboard
 ```
 
----
+The backend preserves the existing GST/TDS/POSSIBLE_GST intelligence, ML assistance, vendor intelligence, learning memory, review logic, CSV/PDF/XLSX loading, and Excel export pipeline. The frontend replaces the Streamlit prototype with a separately deployable React dashboard.
 
-## Quick Start
+## Backend
 
-### 1. Install dependencies
 ```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+uvicorn app.main:app --reload --port 8000
 ```
 
-### 2. Generate sample data (optional)
+API docs are available at:
+
+```text
+http://localhost:8000/docs
+```
+
+Core endpoints:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/statements/upload` | Upload `.xlsx`, `.xls`, `.csv`, or table-based `.pdf` statement |
+| `POST` | `/api/statements/{statement_id}/analyze` | Run transaction classification |
+| `GET` | `/api/statements/{statement_id}/summary` | Fetch KPI, amount, confidence, and review summaries |
+| `GET` | `/api/statements/{statement_id}/transactions` | Fetch classified transactions with filters |
+| `GET` | `/api/statements/{statement_id}/export` | Export category workbook or full ZIP |
+
+## Frontend
+
 ```bash
-python scripts/generate_sample_data.py
+cd frontend
+npm install
+cp .env.example .env
+npm run dev
 ```
 
-### 3. Run the classifier
-```bash
-# Using the default path  (data/input/bank_statement.xlsx)
-python -m src.main
+The frontend expects:
 
-# Custom file path
-python -m src.main path/to/my_statement.xlsx
-
-# Custom output directory
-python -m src.main --output-dir results/
-
-# Verbose / debug mode
-python -m src.main -v
-
-# Skip summary sheet
-python -m src.main --no-summary
+```text
+VITE_API_BASE_URL=http://localhost:8000/api
 ```
 
----
+## Deployment
 
-## Output Files
+- Deploy `backend/` as a Python FastAPI service.
+- Deploy `frontend/` as a static Vite build.
+- Configure `backend/.env` `CORS_ORIGINS` to include the deployed frontend URL.
+- Configure `frontend/.env` `VITE_API_BASE_URL` to point to the deployed backend API.
 
-| File | Contents |
-|------|----------|
-| `gst_transactions.xlsx` | All GST / merchant transactions |
-| `tds_transactions.xlsx` | All TDS / income-tax transactions |
-| `normal_transactions.xlsx` | All unclassified transactions |
-| `classification_summary.xlsx` | Count + total amounts per category |
+## Notes
 
-All files include colour-coded headers:  
-🟠 Amber = TDS &nbsp; 🟢 Green = GST &nbsp; 🔵 Blue = NORMAL
-
----
-
-## Classification Logic
-
-Priority order: **TDS > GST > NORMAL**
-
-### TDS Keywords
-`tds`, `tax deducted`, `income tax`, `it refund`, section codes `192`–`206`, `tcs`, …
-
-### GST Keywords
-`gst`, `cgst`, `sgst`, `igst`, `utgst`, `invoice`, `service tax`, `gst challan`, …
-
-### Merchant / POS (→ GST)
-`card pmt`, `pos`, `cms_`, `swiggy`, `zomato`, `amazon`, `flipkart`, `razorpay`, …
-
----
-
-## Extending the Tool
-
-### Add new keywords
-Edit `utils/constants.py` — append to `TDS_KEYWORDS`, `GST_KEYWORDS`, or `MERCHANT_KEYWORDS`.
-
-### Support a new bank format
-The loader automatically detects the header row. If your bank uses a non-standard column name for the narration, add it to `DESCRIPTION_COLUMN_CANDIDATES` in `constants.py`.
-
-### Add ML-based classification
-Replace or augment `classify_transaction()` in `src/classifier.py` with a model call — the rest of the pipeline stays unchanged.
-
----
-
-## Requirements
-
-- Python 3.10+
-- pandas ≥ 2.0
-- openpyxl ≥ 3.1
+PDF support is best-effort for text/table-based PDFs. Scanned or password-protected statements still require OCR or conversion before analysis.
